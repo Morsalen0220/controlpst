@@ -1,0 +1,23 @@
+{
+  "name": "telegram-personal-auto-poster",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Permission-based Telegram personal-account posting dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "input": "^1.0.1",
+    "multer": "^1.4.5-lts.1",
+    "telegram": "^2.26.21",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

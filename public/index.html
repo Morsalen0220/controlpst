@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telegram Auto Poster</title><link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">T</span><div><b>TelePost</b><small>Personal account manager</small></div></div>
+    <nav>
+      <a class="active" href="#dashboard">▦ Dashboard</a>
+      <a href="#account">◉ Telegram Account</a>
+      <a href="#groups">▤ Manage Groups</a>
+      <a href="#create">＋ Create Post</a>
+      <a href="#posts">◷ Scheduled Posts</a>
+      <a href="#history">↗ Post History</a>
+    </nav>
+    <div class="sidebar-note">Use only in groups where your account is permitted to post. Respect group rules and Telegram limits.</div>
+  </aside>
+  <main>
+    <header><div><p class="eyebrow">CONTROL CENTER</p><h1>Dashboard</h1></div><div class="top-right"><span id="status" class="badge off">● Disconnected</span><button class="ghost" onclick="logout()">Log out</button></div></header>
+    <section class="stats">
+      <article><span>Telegram account</span><strong id="statAccount">Not connected</strong><small>Personal account session</small></article>
+      <article><span>Groups added</span><strong id="statGroups">0</strong><small>Destinations you manage</small></article>
+      <article><span>Scheduled posts</span><strong id="statPosts">0</strong><small>Active and paused</small></article>
+      <article><span>Successful posts</span><strong id="statSuccess">0</strong><small>From posting history</small></article>
+    </section>
+
+    <section class="grid two">
+      <article class="panel" id="account">
+        <div class="panel-head"><div><p class="eyebrow">CONNECTION</p><h2>Telegram Account</h2></div></div>
+        <div id="loginForm">
+          <label>Phone number (international format)</label><input id="phone" placeholder="+8801XXXXXXXXX">
+          <button class="primary" onclick="sendCode()">Send login code</button>
+          <div id="verifyBox" class="hidden">
+            <label>Telegram login code</label><input id="code" placeholder="Enter code">
+            <button class="primary" onclick="verifyCode()">Verify code</button>
+            <label>2FA password (only if requested)</label><input id="password" type="password" placeholder="Telegram two-step password">
+            <button class="secondary" onclick="verify2FA()">Submit 2FA password</button>
+          </div>
+        </div>
+        <p class="hint">Your login code is sent by Telegram. Never share it with anyone. The session is stored locally on this server.</p>
+      </article>
+      <article class="panel" id="groups">
+        <div class="panel-head"><div><p class="eyebrow">DESTINATIONS</p><h2>Manage Groups</h2></div></div>
+        <label>Public group username or t.me link</label><div class="inline"><input id="groupName" placeholder="@publicgroup"><button class="primary" onclick="addGroup()">Add</button></div>
+        <div id="groupsList" class="list"></div>
+      </article>
+    </section>
+
+    <section class="panel" id="create">
+      <div class="panel-head"><div><p class="eyebrow">CONTENT STUDIO</p><h2>Create a scheduled post</h2></div><span class="subtle">One destination per schedule</span></div>
+      <form id="postForm">
+        <div class="form-grid">
+          <div><label>Target group</label><select id="targetGroup" name="group_id" required><option value="">Add a group first</option></select></div>
+          <div><label>Attach image (optional, max 10 MB)</label><input type="file" name="image" accept="image/*"></div>
+          <div class="full"><label>Post text / caption</label><textarea name="text" rows="4" placeholder="Write your post here. Links are allowed."></textarea></div>
+          <div><label>First post date & time</label><input type="datetime-local" id="scheduleAt" name="schedule_at" required></div>
+          <div><label>Repeat interval</label><select name="interval_minutes"><option value="0">Post once</option><option value="60">Every 1 hour</option><option value="180">Every 3 hours</option><option value="360">Every 6 hours</option><option value="720">Every 12 hours</option><option value="1440">Every 24 hours</option></select></div>
+        </div>
+        <div class="form-actions"><p class="hint">Repeat interval is intentionally limited to 60 minutes or more. Posting still depends on each group's permissions and rules.</p><button class="primary" type="submit">Save scheduled post</button></div>
+      </form>
+    </section>
+
+    <section class="panel" id="posts"><div class="panel-head"><div><p class="eyebrow">AUTOMATION QUEUE</p><h2>Scheduled Posts</h2></div><button class="ghost" onclick="refresh()">Refresh</button></div><div id="postsList" class="table-wrap"></div></section>
+    <section class="panel" id="history"><div class="panel-head"><div><p class="eyebrow">ACTIVITY LOG</p><h2>Post History</h2></div></div><div id="historyList" class="table-wrap"></div></section>
+    <div id="toast" class="toast"></div>
+    <footer>TelePost · Local dashboard · Keep your Telegram session private</footer>
+  </main>
+</div>
+<script src="script.js"></script>
+</body></html>

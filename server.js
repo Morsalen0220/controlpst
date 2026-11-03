@@ -66,7 +66,7 @@ let client = null;
 let pendingLogin = null;
 let isConnected = false;
 let loginBusy = false;
-let clientConnecting = false;
+let restorePromise = null;
 let automationPaused = false;
 
 function requireDashboard(req, res, next) {
@@ -97,7 +97,9 @@ function saveEncryptedSession(sessionString) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", getSessionKey(), iv);
   const encrypted = Buffer.concat([cipher.update(sessionString, "utf8"), cipher.final()]);
-  fs.writeFileSync(SESSION_FILE, Buffer.concat([iv, cipher.getAuthTag(), encrypted]), { mode: 0o600 });
+  const tempFile = SESSION_FILE + ".tmp";
+  fs.writeFileSync(tempFile, Buffer.concat([iv, cipher.getAuthTag(), encrypted]), { mode: 0o600 });
+  fs.renameSync(tempFile, SESSION_FILE);
 }
 function readEncryptedSession() {
   if (!fs.existsSync(SESSION_FILE)) return "";
@@ -114,23 +116,57 @@ function persistCurrentSession() {
 }
 
 async function connectSavedSession() {
-  if (clientConnecting || client) return;
-  clientConnecting = true;
-  try {
-    const savedSession = process.env.SESSION_STRING || readEncryptedSession();
-    if (!savedSession) return;
-    client = createClient(savedSession);
-    await client.connect();
-    isConnected = await client.checkAuthorization();
-    if (!isConnected) { await client.disconnect(); client = null; }
-  } catch (e) {
-    console.error("Saved Telegram session could not connect:", e.message);
-    client = null; isConnected = false;
-  } finally { clientConnecting = false; }
+  if (client && isConnected) return true;
+  if (restorePromise) return restorePromise;
+
+  restorePromise = (async () => {
+    let restoredClient = null;
+    try {
+      const savedSession = process.env.SESSION_STRING || readEncryptedSession();
+      if (!savedSession) {
+        console.log("No saved Telegram session found; login is required.");
+        return false;
+      }
+
+      restoredClient = createClient(savedSession);
+      await restoredClient.connect();
+      const authorized = await restoredClient.checkAuthorization();
+
+      if (!authorized) {
+        await restoredClient.disconnect();
+        console.warn("Saved Telegram session is no longer authorized.");
+        return false;
+      }
+
+      client = restoredClient;
+      isConnected = true;
+      console.log("Saved Telegram session restored successfully.");
+      return true;
+    } catch (e) {
+      console.error("Saved Telegram session could not be restored:", e.message);
+      if (restoredClient) {
+        try { await restoredClient.disconnect(); } catch (_) {}
+      }
+      client = null;
+      isConnected = false;
+      return false;
+    } finally {
+      restorePromise = null;
+    }
+  })();
+
+  return restorePromise;
 }
-function requireTelegram(req, res, next) {
-  if (!client || !isConnected) return res.status(400).json({ error: "Connect your Telegram account first." });
-  next();
+async function requireTelegram(req, res, next) {
+  try {
+    if (!client || !isConnected) await connectSavedSession();
+    if (!client || !isConnected) {
+      return res.status(400).json({ error: "Telegram is disconnected. Please connect your account again." });
+    }
+    next();
+  } catch (e) {
+    res.status(503).json({ error: "Could not restore Telegram connection: " + e.message });
+  }
 }
 function normalizeUsername(value) {
   return String(value || "").trim().replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "").replace(/\/.*$/, "");
@@ -138,7 +174,10 @@ function normalizeUsername(value) {
 
 // Account status
 app.get("/api/status", async (req, res) => {
-  res.json({ connected: isConnected, phone: pendingLogin?.phone || null });
+  // Wait for session restoration before reporting status. This avoids a false
+  // "Disconnected" immediately after a Render restart or a new page load.
+  if (!client || !isConnected) await connectSavedSession();
+  res.json({ connected: Boolean(client && isConnected), phone: pendingLogin?.phone || null });
 });
 
 // Login: send code
@@ -180,6 +219,7 @@ app.post("/api/login/verify", async (req, res) => {
     client = pendingLogin.temp;
     isConnected = true;
     persistCurrentSession();
+    console.log("Telegram login authorized; encrypted session saved to:", SESSION_FILE);
     pendingLogin = null; loginBusy = false;
     res.json({ ok: true, message: "Telegram account connected." });
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -197,6 +237,7 @@ app.post("/api/login/2fa", async (req, res) => {
     client = pendingLogin.temp;
     isConnected = true;
     persistCurrentSession();
+    console.log("Telegram login authorized; encrypted session saved to:", SESSION_FILE);
     pendingLogin = null; loginBusy = false;
     res.json({ ok: true, message: "Telegram account connected." });
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -206,6 +247,8 @@ app.post("/api/logout", async (req, res) => {
   try {
     if (client) await client.disconnect();
     client = null; isConnected = false;
+    if (pendingLogin?.temp) { try { await pendingLogin.temp.disconnect(); } catch (_) {} }
+    pendingLogin = null; loginBusy = false;
     process.env.SESSION_STRING = "";
     if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
     res.json({ ok: true });

@@ -7,6 +7,7 @@ const multer = require("multer");
 const Database = require("better-sqlite3");
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
+const { computeCheck } = require("telegram/Password");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -165,11 +166,11 @@ app.post("/api/login/verify", async (req, res) => {
     if (!pendingLogin) return res.status(400).json({ error: "Request a login code first." });
     const code = String(req.body.code || "").trim();
     try {
-      await pendingLogin.temp.signIn({
+      await pendingLogin.temp.invoke(new Api.auth.SignIn({
         phoneNumber: pendingLogin.phone,
         phoneCodeHash: pendingLogin.phoneCodeHash,
         phoneCode: code
-      });
+      }));
     } catch (e) {
       if (String(e.errorMessage || e.message).includes("SESSION_PASSWORD_NEEDED")) {
         return res.json({ needs2FA: true, message: "Two-step verification is enabled. Enter your Telegram 2FA password." });
@@ -188,10 +189,11 @@ app.post("/api/login/2fa", async (req, res) => {
   try {
     if (!pendingLogin) return res.status(400).json({ error: "Login session expired. Request a new code." });
     const password = String(req.body.password || "");
-    await pendingLogin.temp.signInWithPassword(
-      { apiId: API_ID, apiHash: API_HASH },
-      { password: async () => password, onError: (err) => { throw err; } }
-    );
+    const passwordInfo = await pendingLogin.temp.invoke(new Api.account.GetPassword());
+    const passwordCheck = await computeCheck(passwordInfo, password);
+    await pendingLogin.temp.invoke(new Api.auth.CheckPassword({
+      password: passwordCheck
+    }));
     client = pendingLogin.temp;
     isConnected = true;
     persistCurrentSession();

@@ -9,10 +9,11 @@ async function api(url, options={}) {
   return data;
 }
 async function unlock(){
-  if(password) return;
-  const p=prompt("Enter the dashboard password configured in .env:");
-  if(p===null)return;
-  password=p;sessionStorage.setItem("dashpass",p);
+  if(!password){
+    const p=prompt("Enter the dashboard password configured in .env:");
+    if(p===null)return;
+    password=p;sessionStorage.setItem("dashpass",p);
+  }
   try{await refresh()}catch(e){password="";sessionStorage.removeItem("dashpass");toast(e.message)}
 }
 async function sendCode(){
@@ -32,7 +33,14 @@ async function removeGroup(id){if(!confirm("Remove this group and its scheduled 
 async function togglePost(id){try{await api("/api/posts/"+id+"/toggle",{method:"POST"});refresh()}catch(e){toast(e.message)}}
 async function deletePost(id){if(!confirm("Delete this scheduled post?"))return;try{await api("/api/posts/"+id,{method:"DELETE"});refresh()}catch(e){toast(e.message)}}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
-function fmt(s){return s?new Date(s).toLocaleString():"—"}
+function fmt(s){
+  if(!s) return "—";
+  try {
+    return new Date(s).toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true });
+  } catch(_) {
+    return new Date(s).toLocaleString();
+  }
+}
 async function refresh(){
   try{
     const [status,groups,posts,history]=await Promise.all([api("/api/status"),api("/api/groups"),api("/api/posts"),api("/api/history")]);
@@ -46,7 +54,24 @@ async function refresh(){
 }
 $("postForm").addEventListener("submit",async e=>{
   e.preventDefault();
-  try{const form=new FormData(e.target);await api("/api/posts",{method:"POST",body:form});e.target.reset();toast("Scheduled post saved.");refresh()}catch(err){toast(err.message)}
+  try{
+    const form=new FormData(e.target);
+    const rawSchedule = $("scheduleAt").value;
+    if(rawSchedule){
+      const localDate = new Date(rawSchedule);
+      if(!isNaN(localDate.getTime())){
+        form.set("schedule_at", localDate.toISOString());
+      }
+    }
+    await api("/api/posts",{method:"POST",body:form});
+    e.target.reset();
+    const dtNow=new Date(Date.now()-new Date().getTimezoneOffset()*60000);
+    $("scheduleAt").value=dtNow.toISOString().slice(0,16);
+    if($("intervalInput")) $("intervalInput").value="0";
+    if($("intervalPreset")) $("intervalPreset").value="0";
+    toast("Scheduled post saved.");
+    refresh();
+  }catch(err){toast(err.message)}
 });
 const dt=new Date(Date.now()-new Date().getTimezoneOffset()*60000);$("scheduleAt").value=dt.toISOString().slice(0,16);
 unlock();

@@ -48,8 +48,73 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
       }
     };
   }
+  const TIMEZONE = process.env.TIMEZONE || "Asia/Dhaka";
+  const TZ_OFFSET_HOURS = Number(process.env.TIMEZONE_OFFSET_HOURS !== undefined ? process.env.TIMEZONE_OFFSET_HOURS : 6);
+
   function fmtDate(value) {
-    return value ? new Date(value).toLocaleString() : "—";
+    if (!value) return "—";
+    try {
+      return new Date(value).toLocaleString("en-US", { timeZone: TIMEZONE, hour12: true });
+    } catch (_) {
+      return new Date(value).toLocaleString();
+    }
+  }
+
+  function parseUserDateTime(input) {
+    const str = String(input || "").trim().toLowerCase();
+    const now = Date.now();
+    // Relative format: 1m, 10m, 30m, 1h
+    const relMatch = str.match(/^(\d+)\s*(m|min|minute|minutes|h|hr|hour|hours)$/);
+    if (relMatch) {
+      const num = Number(relMatch[1]);
+      const unit = relMatch[2];
+      const ms = unit.startsWith("h") ? num * 3600000 : num * 60000;
+      return new Date(now + ms);
+    }
+    // Full format: YYYY-MM-DD HH:mm
+    const fullMatch = str.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$/);
+    if (fullMatch) {
+      const y = Number(fullMatch[1]);
+      const m = Number(fullMatch[2]) - 1;
+      const d = Number(fullMatch[3]);
+      const h = Number(fullMatch[4]);
+      const min = Number(fullMatch[5]);
+      const utcMs = Date.UTC(y, m, d, h, min) - (TZ_OFFSET_HOURS * 3600000);
+      return new Date(utcMs);
+    }
+    // Time-only format: HH:mm
+    const timeMatch = str.match(/^(\d{1,2}):(\d{2})$/);
+    if (timeMatch) {
+      const h = Number(timeMatch[1]);
+      const min = Number(timeMatch[2]);
+      const nowInTz = new Date(now + TZ_OFFSET_HOURS * 3600000);
+      const y = nowInTz.getUTCFullYear();
+      const m = nowInTz.getUTCMonth();
+      let d = nowInTz.getUTCDate();
+      let utcMs = Date.UTC(y, m, d, h, min) - (TZ_OFFSET_HOURS * 3600000);
+      if (utcMs <= now) {
+        d += 1;
+        utcMs = Date.UTC(y, m, d, h, min) - (TZ_OFFSET_HOURS * 3600000);
+      }
+      return new Date(utcMs);
+    }
+    return null;
+  }
+
+  function intervalKeyboard() {
+    return {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "একবারই (No repeat)", callback_data: "interval:0" }],
+          [{ text: "প্রতি ১ মিনিট", callback_data: "interval:1" }, { text: "প্রতি ৫ মিনিট", callback_data: "interval:5" }],
+          [{ text: "প্রতি ১০ মিনিট", callback_data: "interval:10" }, { text: "প্রতি ৩০ মিনিট", callback_data: "interval:30" }],
+          [{ text: "প্রতি ১ ঘণ্টা", callback_data: "interval:60" }, { text: "প্রতি ৩ ঘণ্টা", callback_data: "interval:180" }],
+          [{ text: "প্রতি ৬ ঘণ্টা", callback_data: "interval:360" }, { text: "প্রতি ১২ ঘণ্টা", callback_data: "interval:720" }],
+          [{ text: "প্রতি ২৪ ঘণ্টা", callback_data: "interval:1440" }, { text: "✍️ Custom মিনিট", callback_data: "interval:custom" }],
+          [{ text: "Cancel", callback_data: "wizard:cancel" }]
+        ]
+      }
+    };
   }
   function addSchedule({ groupId, text, mediaPath, scheduleAt, intervalMinutes }) {
     return db.prepare(`
@@ -81,7 +146,7 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
   bot.on("message", async msg => {
     if (!msg.chat || msg.chat.type !== "private") return;
     if (!authorized(msg)) {
-      // Do not reveal bot functionality or process commands for other users.
+      console.warn(`[Control Bot] Ignored message from unauthorized user ID: ${msg.from?.id} (configured BOT_OWNER_ID is: ${ownerId})`);
       return;
     }
     const chatId = msg.chat.id;
@@ -182,21 +247,31 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
         });
       }
       if (state?.step === "schedule_time") {
-        // Expected format: YYYY-MM-DD HH:mm (server local time)
-        const match = text.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/);
-        if (!match) return say(chatId, "এই format-এ সময় দিন: 2026-11-04 18:30");
-        const date = new Date(Number(match[1]), Number(match[2])-1, Number(match[3]), Number(match[4]), Number(match[5]));
-        if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) return say(chatId, "ভবিষ্যতের একটি সঠিক date/time দিন। উদাহরণ: 2026-11-04 18:30");
+        const date = parseUserDateTime(text);
+        if (!date || Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
+          return say(chatId, "সঠিক সময় দিন।\nউদাহরণ:\n• `10m` (১০ মিনিট পর)\n• `1m` (১ মিনিট পর)\n• `18:30` (আজকের সময়)\n• `2026-11-04 18:30` (সম্পূর্ণ তারিখ ও সময়)", { parse_mode: "Markdown" });
+        }
         state.scheduleAt = date.toISOString();
         state.step = "interval";
-        return say(chatId, "কতক্ষণ পরপর Repeat হবে?", {
-          reply_markup: { inline_keyboard: [
-            [{text:"একবারই",callback_data:"interval:0"},{text:"প্রতি ১ ঘণ্টা",callback_data:"interval:60"}],
-            [{text:"প্রতি ৩ ঘণ্টা",callback_data:"interval:180"},{text:"প্রতি ৬ ঘণ্টা",callback_data:"interval:360"}],
-            [{text:"প্রতি ১২ ঘণ্টা",callback_data:"interval:720"},{text:"প্রতি ২৪ ঘণ্টা",callback_data:"interval:1440"}],
-            [{text:"Cancel",callback_data:"wizard:cancel"}]
-          ]}
+        return say(chatId, `সময় সেট করা হয়েছে: *${fmtDate(state.scheduleAt)}*\n\nকতক্ষণ পরপর Repeat হবে?`, {
+          parse_mode: "Markdown",
+          ...intervalKeyboard()
         });
+      }
+      if (state?.step === "custom_interval") {
+        const num = Number(text);
+        if (Number.isNaN(num) || num < 0 || num > 10080) {
+          return say(chatId, "সঠিক মিনিট সংখ্যা দিন (যেমন: 1, 10, 45, 120)।");
+        }
+        addSchedule({
+          groupId: state.groupId,
+          text: state.text,
+          mediaPath: state.mediaPath,
+          scheduleAt: state.scheduleAt,
+          intervalMinutes: num
+        });
+        states.delete(String(msg.from.id));
+        return say(chatId, `✅ Post schedule saved.\nGroup: @${state.groupName}\nFirst run: ${fmtDate(state.scheduleAt)}\nRepeat: ${num ? num + " minutes" : "Once"}`, mainKeyboard);
       }
     } catch (e) {
       console.error("Control bot message error:", e);
@@ -239,27 +314,27 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
       }
       if (data.startsWith("timing:")) {
         if (!state || state.step !== "timing") return bot.answerCallbackQuery(query.id, { text: "Post flow expired." });
-        if (data === "timing:now") state.scheduleAt = new Date().toISOString();
-        else {
+        if (data === "timing:now") {
+          state.scheduleAt = new Date().toISOString();
+          state.step = "interval";
+          await bot.answerCallbackQuery(query.id);
+          return say(chatId, "কতক্ষণ পরপর Repeat হবে?", intervalKeyboard());
+        } else {
           state.step = "schedule_time";
           await bot.answerCallbackQuery(query.id);
-          return say(chatId, "Date ও time পাঠান (server-এর local time অনুযায়ী):\n`2026-11-04 18:30`", { parse_mode:"Markdown" });
+          return say(chatId, "কখন পোস্ট করবেন? সময় লিখে পাঠান:\n\n• `10m` (১০ মিনিট পর)\n• `1m` (১ মিনিট পর)\n• `18:30` (আজকের সময়)\n• `2026-11-04 18:30` (তারিখ ও সময়)", { parse_mode:"Markdown" });
         }
-        state.step = "interval";
+      }
+      if (data === "interval:custom") {
+        if (!state || state.step !== "interval") return bot.answerCallbackQuery(query.id, { text: "Post flow expired." });
+        state.step = "custom_interval";
         await bot.answerCallbackQuery(query.id);
-        return say(chatId, "কতক্ষণ পরপর Repeat হবে?", {
-          reply_markup: { inline_keyboard: [
-            [{text:"একবারই",callback_data:"interval:0"},{text:"প্রতি ১ ঘণ্টা",callback_data:"interval:60"}],
-            [{text:"প্রতি ৩ ঘণ্টা",callback_data:"interval:180"},{text:"প্রতি ৬ ঘণ্টা",callback_data:"interval:360"}],
-            [{text:"প্রতি ১২ ঘণ্টা",callback_data:"interval:720"},{text:"প্রতি ২৪ ঘণ্টা",callback_data:"interval:1440"}],
-            [{text:"Cancel",callback_data:"wizard:cancel"}]
-          ]}
-        });
+        return say(chatId, "কত মিনিট পরপর Repeat হবে? মিনিট সংখ্যা লিখে পাঠান (যেমন: 1, 10, 45, 120):");
       }
       if (data.startsWith("interval:")) {
         if (!state || state.step !== "interval") return bot.answerCallbackQuery(query.id, { text: "Post flow expired." });
         const interval = Number(data.split(":")[1]);
-        if (![0,60,180,360,720,1440].includes(interval)) return bot.answerCallbackQuery(query.id, { text: "Invalid interval." });
+        if (Number.isNaN(interval) || interval < 0 || interval > 10080) return bot.answerCallbackQuery(query.id, { text: "Invalid interval." });
         addSchedule({
           groupId: state.groupId,
           text: state.text,

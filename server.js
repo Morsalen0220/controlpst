@@ -24,11 +24,42 @@ fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 // Firebase Realtime Database is used for the encrypted Telegram session.
 // Set FIREBASE_SERVICE_ACCOUNT_JSON to the full service-account JSON content.
 let firebaseSessionRef = null;
+let firebaseError = null;
+
+function parseServiceAccount(raw) {
+  let cleaned = String(raw || "").trim();
+  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (_) {
+    parsed = JSON.parse(Buffer.from(cleaned, "base64").toString("utf8"));
+  }
+  if (typeof parsed === "string") {
+    parsed = JSON.parse(parsed);
+  }
+  if (parsed && typeof parsed.private_key === "string") {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+  }
+  return parsed;
+}
+
 try {
   const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  const databaseURL = process.env.FIREBASE_DATABASE_URL;
-  if (serviceAccountJson && databaseURL) {
-    const serviceAccount = JSON.parse(serviceAccountJson);
+  let databaseURL = String(process.env.FIREBASE_DATABASE_URL || "").trim().replace(/^['"]|['"]$/g, "");
+  if (serviceAccountJson) {
+    const serviceAccount = parseServiceAccount(serviceAccountJson);
+    if (!databaseURL && serviceAccount.project_id) {
+      databaseURL = `https://${serviceAccount.project_id}-default-rtdb.firebaseio.com`;
+    }
+    if (databaseURL && !/^https?:\/\//i.test(databaseURL)) {
+      databaseURL = `https://${databaseURL}`;
+    }
+    if (!databaseURL) {
+      throw new Error("FIREBASE_DATABASE_URL is missing.");
+    }
     if (!admin.apps.length) {
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
@@ -36,11 +67,13 @@ try {
       });
     }
     firebaseSessionRef = admin.database().ref("private/telegramSession");
-    console.log("Firebase session storage initialized.");
+    console.log("Firebase session storage initialized:", databaseURL);
   } else {
+    firebaseError = "FIREBASE_SERVICE_ACCOUNT_JSON is not set in environment variables.";
     console.warn("Firebase session storage is not configured; using local session file only.");
   }
 } catch (e) {
+  firebaseError = e.message;
   console.error("Firebase initialization failed:", e.message);
 }
 const API_ID = Number(process.env.API_ID || 0);
@@ -226,7 +259,12 @@ app.get("/api/status", async (req, res) => {
   // Wait for session restoration before reporting status. This avoids a false
   // "Disconnected" immediately after a Render restart or a new page load.
   if (!client || !isConnected) await connectSavedSession();
-  res.json({ connected: Boolean(client && isConnected), phone: pendingLogin?.phone || null });
+  res.json({
+    connected: Boolean(client && isConnected),
+    phone: pendingLogin?.phone || null,
+    firebaseConfigured: Boolean(firebaseSessionRef),
+    firebaseError: firebaseError || null
+  });
 });
 
 // Login: send code
@@ -328,6 +366,29 @@ app.delete("/api/groups/:id", (req, res) => {
   res.json({ ok: true });
 });
 
+function parseScheduleAt(value) {
+  if (!value) return new Date().toISOString();
+  const str = String(value).trim();
+  if (str.endsWith("Z") || /[+-]\d{2}:?\d{2}$/.test(str)) {
+    const d = new Date(str);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  const tzHours = Number(process.env.TIMEZONE_OFFSET_HOURS !== undefined ? process.env.TIMEZONE_OFFSET_HOURS : 6);
+  const m = str.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (m) {
+    const y = Number(m[1]);
+    const mon = Number(m[2]) - 1;
+    const d = Number(m[3]);
+    const h = Number(m[4]);
+    const min = Number(m[5]);
+    const s = Number(m[6] || 0);
+    const utcMs = Date.UTC(y, mon, d, h, min, s) - (tzHours * 3600000);
+    return new Date(utcMs).toISOString();
+  }
+  const d = new Date(str);
+  return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
+
 // Create scheduled post (one group per scheduled item)
 app.post("/api/posts", requireTelegram, upload.single("image"), (req, res) => {
   try {
@@ -336,9 +397,9 @@ app.post("/api/posts", requireTelegram, upload.single("image"), (req, res) => {
     if (!group) return res.status(400).json({ error: "Choose a group first." });
     const text = String(req.body.text || "").trim();
     const interval = Math.max(0, Math.min(10080, Number(req.body.interval_minutes || 0)));
-    const scheduleAt = req.body.schedule_at ? new Date(req.body.schedule_at).toISOString() : new Date().toISOString();
+    const scheduleAt = parseScheduleAt(req.body.schedule_at);
     if (!text && !req.file) return res.status(400).json({ error: "Enter text or attach an image." });
-    if (interval > 0 && interval < 60) return res.status(400).json({ error: "For safety, the minimum repeat interval is 60 minutes." });
+    if (interval < 0) return res.status(400).json({ error: "Interval cannot be negative." });
     const mediaPath = req.file ? req.file.path : null;
     const row = db.prepare(`
       INSERT INTO posts (group_id, text, media_path, schedule_at, interval_minutes, next_run_at, active)

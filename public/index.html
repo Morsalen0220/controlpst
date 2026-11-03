@@ -57,9 +57,28 @@
           <div><label>Attach image (optional, max 10 MB)</label><input type="file" name="image" accept="image/*"></div>
           <div class="full"><label>Post text / caption</label><textarea name="text" rows="4" placeholder="Write your post here. Links are allowed."></textarea></div>
           <div><label>First post date & time</label><input type="datetime-local" id="scheduleAt" name="schedule_at" required></div>
-          <div><label>Repeat interval</label><select name="interval_minutes"><option value="0">Post once</option><option value="60">Every 1 hour</option><option value="180">Every 3 hours</option><option value="360">Every 6 hours</option><option value="720">Every 12 hours</option><option value="1440">Every 24 hours</option></select></div>
+          <div>
+            <label>Repeat interval</label>
+            <div style="display:flex;gap:8px;">
+              <select id="intervalPreset" onchange="if(this.value!=='custom'){$('intervalInput').value=this.value}">
+                <option value="0">Post once</option>
+                <option value="1">Every 1 minute</option>
+                <option value="5">Every 5 minutes</option>
+                <option value="10">Every 10 minutes</option>
+                <option value="15">Every 15 minutes</option>
+                <option value="30">Every 30 minutes</option>
+                <option value="60">Every 1 hour (60 min)</option>
+                <option value="180">Every 3 hours</option>
+                <option value="360">Every 6 hours</option>
+                <option value="720">Every 12 hours</option>
+                <option value="1440">Every 24 hours</option>
+                <option value="custom">Custom minutes...</option>
+              </select>
+              <input type="number" id="intervalInput" name="interval_minutes" value="0" min="0" max="10080" placeholder="Min" style="width:105px;" oninput="$('intervalPreset').value='custom'">
+            </div>
+          </div>
         </div>
-        <div class="form-actions"><p class="hint">Repeat interval is intentionally limited to 60 minutes or more. Posting still depends on each group's permissions and rules.</p><button class="primary" type="submit">Save scheduled post</button></div>
+        <div class="form-actions"><p class="hint">Minimum repeat interval is 1 minute. Posting still depends on each group's permissions and rules.</p><button class="primary" type="submit">Save scheduled post</button></div>
       </form>
     </section>
 

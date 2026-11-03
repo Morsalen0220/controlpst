@@ -8,15 +8,41 @@ const Database = require("better-sqlite3");
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { computeCheck } = require("telegram/Password");
+const admin = require("firebase-admin");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
+// Render Free has no Persistent Disk. Keep writable local files under the app
+// directory; Telegram session persistence is handled separately by Firebase.
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 const SESSION_FILE = path.join(DATA_DIR, "telegram-session.enc");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// Firebase Realtime Database is used for the encrypted Telegram session.
+// Set FIREBASE_SERVICE_ACCOUNT_JSON to the full service-account JSON content.
+let firebaseSessionRef = null;
+try {
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const databaseURL = process.env.FIREBASE_DATABASE_URL;
+  if (serviceAccountJson && databaseURL) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL
+      });
+    }
+    firebaseSessionRef = admin.database().ref("private/telegramSession");
+    console.log("Firebase session storage initialized.");
+  } else {
+    console.warn("Firebase session storage is not configured; using local session file only.");
+  }
+} catch (e) {
+  console.error("Firebase initialization failed:", e.message);
+}
 const API_ID = Number(process.env.API_ID || 0);
 const API_HASH = process.env.API_HASH || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
@@ -93,26 +119,49 @@ function getSessionKey() {
   if (!secret) throw new Error("SESSION_ENCRYPTION_KEY is required to save Telegram login securely.");
   return crypto.createHash("sha256").update(secret).digest();
 }
-function saveEncryptedSession(sessionString) {
+function encryptSession(sessionString) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", getSessionKey(), iv);
   const encrypted = Buffer.concat([cipher.update(sessionString, "utf8"), cipher.final()]);
-  const tempFile = SESSION_FILE + ".tmp";
-  fs.writeFileSync(tempFile, Buffer.concat([iv, cipher.getAuthTag(), encrypted]), { mode: 0o600 });
-  fs.renameSync(tempFile, SESSION_FILE);
+  return Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64");
 }
-function readEncryptedSession() {
-  if (!fs.existsSync(SESSION_FILE)) return "";
-  const raw = fs.readFileSync(SESSION_FILE);
-  if (raw.length < 29) throw new Error("Saved Telegram session file is invalid.");
+function decryptSession(encoded) {
+  const raw = Buffer.from(encoded, "base64");
+  if (raw.length < 29) throw new Error("Saved Telegram session data is invalid.");
   const decipher = crypto.createDecipheriv("aes-256-gcm", getSessionKey(), raw.subarray(0, 12));
   decipher.setAuthTag(raw.subarray(12, 28));
   return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString("utf8");
 }
-function persistCurrentSession() {
+async function saveEncryptedSession(sessionString) {
+  const encrypted = encryptSession(sessionString);
+  if (firebaseSessionRef) {
+    await firebaseSessionRef.set({
+      encrypted,
+      updatedAt: new Date().toISOString(),
+      version: 1
+    });
+    console.log("Encrypted Telegram session saved to Firebase Realtime Database.");
+    return;
+  }
+  // Local fallback is useful for development, but is not persistent on Render Free.
+  const tempFile = SESSION_FILE + ".tmp";
+  fs.writeFileSync(tempFile, Buffer.from(encrypted, "utf8"), { mode: 0o600 });
+  fs.renameSync(tempFile, SESSION_FILE);
+  console.warn("Telegram session saved locally only; configure Firebase for Render Free persistence.");
+}
+async function readEncryptedSession() {
+  if (firebaseSessionRef) {
+    const snapshot = await firebaseSessionRef.get();
+    const value = snapshot.val();
+    if (value && value.encrypted) return decryptSession(value.encrypted);
+  }
+  if (!fs.existsSync(SESSION_FILE)) return "";
+  return decryptSession(fs.readFileSync(SESSION_FILE, "utf8"));
+}
+async function persistCurrentSession() {
   const sessionString = client?.session?.save?.() || "";
   if (!sessionString) throw new Error("Telegram session is empty; cannot persist login.");
-  saveEncryptedSession(sessionString);
+  await saveEncryptedSession(sessionString);
 }
 
 async function connectSavedSession() {
@@ -122,7 +171,7 @@ async function connectSavedSession() {
   restorePromise = (async () => {
     let restoredClient = null;
     try {
-      const savedSession = process.env.SESSION_STRING || readEncryptedSession();
+      const savedSession = process.env.SESSION_STRING || await readEncryptedSession();
       if (!savedSession) {
         console.log("No saved Telegram session found; login is required.");
         return false;
@@ -218,7 +267,7 @@ app.post("/api/login/verify", async (req, res) => {
     }
     client = pendingLogin.temp;
     isConnected = true;
-    persistCurrentSession();
+    await persistCurrentSession();
     console.log("Telegram login authorized; encrypted session saved to:", SESSION_FILE);
     pendingLogin = null; loginBusy = false;
     res.json({ ok: true, message: "Telegram account connected." });
@@ -236,7 +285,7 @@ app.post("/api/login/2fa", async (req, res) => {
     }));
     client = pendingLogin.temp;
     isConnected = true;
-    persistCurrentSession();
+    await persistCurrentSession();
     console.log("Telegram login authorized; encrypted session saved to:", SESSION_FILE);
     pendingLogin = null; loginBusy = false;
     res.json({ ok: true, message: "Telegram account connected." });
@@ -250,6 +299,7 @@ app.post("/api/logout", async (req, res) => {
     if (pendingLogin?.temp) { try { await pendingLogin.temp.disconnect(); } catch (_) {} }
     pendingLogin = null; loginBusy = false;
     process.env.SESSION_STRING = "";
+    if (firebaseSessionRef) await firebaseSessionRef.remove();
     if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }

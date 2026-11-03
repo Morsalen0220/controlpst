@@ -15,7 +15,8 @@
     "input": "^1.0.1",
     "multer": "^1.4.5-lts.1",
     "telegram": "^2.26.21",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "firebase-admin": "^13.4.0"
   },
   "engines": {
     "node": "22.x"

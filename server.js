@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS history (
 );
 `);
 
+const { createFirebaseSync } = require("./firebase-sync");
+const firebaseSync = createFirebaseSync({
+  db,
+  admin,
+  uploadsDir: UPLOADS_DIR
+});
+
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/uploads", express.static(UPLOADS_DIR));
@@ -356,6 +363,7 @@ app.post("/api/groups", requireTelegram, async (req, res) => {
     // Verify the account can resolve the group. Actual send permission is checked by Telegram at post time.
     const result = db.prepare("INSERT OR IGNORE INTO groups (username, title) VALUES (?, ?)").run(username, title);
     const row = db.prepare("SELECT * FROM groups WHERE username = ?").get(username);
+    if (row) firebaseSync.syncGroup(row);
     res.json(row);
   } catch (e) { res.status(400).json({ error: "Could not add group: " + e.message }); }
 });
@@ -363,6 +371,7 @@ app.delete("/api/groups/:id", (req, res) => {
   const id = Number(req.params.id);
   db.prepare("DELETE FROM posts WHERE group_id = ?").run(id);
   db.prepare("DELETE FROM groups WHERE id = ?").run(id);
+  firebaseSync.deleteGroup(id);
   res.json({ ok: true });
 });
 
@@ -405,6 +414,8 @@ app.post("/api/posts", requireTelegram, upload.single("image"), (req, res) => {
       INSERT INTO posts (group_id, text, media_path, schedule_at, interval_minutes, next_run_at, active)
       VALUES (?, ?, ?, ?, ?, ?, 1)
     `).run(groupId, text, mediaPath, scheduleAt, interval, scheduleAt);
+    const postRow = db.prepare("SELECT * FROM posts WHERE id = ?").get(row.lastInsertRowid);
+    if (postRow) firebaseSync.syncPost(postRow);
     res.json({ ok: true, id: row.lastInsertRowid });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -419,11 +430,15 @@ app.post("/api/posts/:id/toggle", (req, res) => {
   const id = Number(req.params.id);
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(id);
   if (!post) return res.status(404).json({ error: "Post not found." });
-  db.prepare("UPDATE posts SET active = ? WHERE id = ?").run(post.active ? 0 : 1, id);
+  const newActive = post.active ? 0 : 1;
+  db.prepare("UPDATE posts SET active = ? WHERE id = ?").run(newActive, id);
+  firebaseSync.syncPostField(id, "active", newActive);
   res.json({ ok: true });
 });
 app.delete("/api/posts/:id", (req, res) => {
-  db.prepare("DELETE FROM posts WHERE id = ?").run(Number(req.params.id));
+  const id = Number(req.params.id);
+  db.prepare("DELETE FROM posts WHERE id = ?").run(id);
+  firebaseSync.deletePost(id);
   res.json({ ok: true });
 });
 app.get("/api/history", (req, res) => {
@@ -452,20 +467,25 @@ async function processDuePosts() {
       } else {
         await client.sendMessage(entity, { message: post.text });
       }
-      db.prepare("INSERT INTO history (post_id, group_name, result, detail) VALUES (?, ?, 'SUCCESS', 'Posted successfully')").run(post.id, post.username);
+      const hRow = db.prepare("INSERT INTO history (post_id, group_name, result, detail) VALUES (?, ?, 'SUCCESS', 'Posted successfully')").run(post.id, post.username);
+      firebaseSync.syncHistory({ id: hRow.lastInsertRowid, post_id: post.id, group_name: post.username, result: "SUCCESS", detail: "Posted successfully", posted_at: new Date().toISOString() });
     } catch (e) {
-      db.prepare("INSERT INTO history (post_id, group_name, result, detail) VALUES (?, ?, 'FAILED', ?)").run(post.id, post.username, e.message.slice(0, 500));
+      const hRow = db.prepare("INSERT INTO history (post_id, group_name, result, detail) VALUES (?, ?, 'FAILED', ?)").run(post.id, post.username, e.message.slice(0, 500));
+      firebaseSync.syncHistory({ id: hRow.lastInsertRowid, post_id: post.id, group_name: post.username, result: "FAILED", detail: e.message.slice(0, 500), posted_at: new Date().toISOString() });
       // Stop repeat on permission/invalid peer errors; don't repeatedly retry a forbidden destination.
       const msg = String(e.message).toLowerCase();
       if (msg.includes("write_forbidden") || msg.includes("chat_write_forbidden") || msg.includes("private") || msg.includes("not enough rights")) {
         db.prepare("UPDATE posts SET active = 0 WHERE id = ?").run(post.id);
+        firebaseSync.syncPostField(post.id, "active", 0);
       }
     }
     if (post.interval_minutes > 0) {
       const next = new Date(Date.now() + post.interval_minutes * 60000).toISOString();
       db.prepare("UPDATE posts SET next_run_at = ? WHERE id = ?").run(next, post.id);
+      firebaseSync.syncPostField(post.id, "next_run_at", next);
     } else {
       db.prepare("UPDATE posts SET active = 0 WHERE id = ?").run(post.id);
+      firebaseSync.syncPostField(post.id, "active", 0);
     }
   } finally { schedulerBusy = false; }
 }
@@ -473,10 +493,12 @@ setInterval(processDuePosts, 15000);
 
 app.listen(PORT, HOST, async () => {
   console.log(`Dashboard listening on ${HOST}:${PORT}`);
+  await firebaseSync.restoreAllFromFirebase();
   await connectSavedSession();
   const { startControlBot } = require("./control-bot");
   startControlBot({
     db,
+    firebaseSync,
     getClient: () => client,
     isConnected: () => isConnected,
     uploadsDir: UPLOADS_DIR,

@@ -59,19 +59,15 @@ Your personal account must be a member of each destination group and must have p
 Each schedule targets one group; create one schedule per group. Image upload limit is 10 MB.
 
 
-## Firebase session storage (Render Free)
+## Firebase Cloud Storage (Render Free Support)
 
-To persist the encrypted Telegram login session without a Render Persistent Disk:
+All groups, scheduled posts, post history, uploaded images, and encrypted Telegram sessions are automatically synchronized with Firebase Realtime Database:
 
-1. Create a Firebase Realtime Database and copy its Database URL.
+1. Create a Firebase Realtime Database in Firebase Console and copy its Database URL.
 2. In Firebase Project settings → Service accounts, generate a private key JSON.
 3. In Render → Environment, add:
-   - `FIREBASE_DATABASE_URL` = your Realtime Database URL
+   - `FIREBASE_DATABASE_URL` = your Realtime Database URL (e.g. `https://xxxx-default-rtdb.firebaseio.com`)
    - `FIREBASE_SERVICE_ACCOUNT_JSON` = the complete contents of the service-account JSON file
    - `SESSION_ENCRYPTION_KEY` = a strong secret; keep the same value permanently
-4. On Render Free, remove `DATA_DIR=/var/data` if it exists, or change it to `./data`.
-5. Redeploy, then log in to Telegram again. Logs should show `Firebase session storage initialized.` and `Encrypted Telegram session saved to Firebase Realtime Database.`
-
-Never commit the service-account JSON or expose it in chat. Firebase Admin SDK credentials bypass Realtime Database Security Rules, so keep the service-account key private and restrict access to Render environment variables.
-
-Important: this change persists the Telegram login session only. SQLite groups, schedules, post history, and uploaded images remain on Render's ephemeral filesystem and may be lost after a restart/redeploy on the Free plan. They need a separate persistent database/storage migration for full persistence.
+4. On Render Free, set `DATA_DIR=./data`.
+5. Deploy. When the server starts up, it automatically restores all groups, posts, images, and history from Firebase Realtime Database. Any changes made via the Dashboard or Telegram Bot are instantly backed up to Firebase in real-time.

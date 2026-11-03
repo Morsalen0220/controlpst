@@ -2,7 +2,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
 const path = require("path");
 
-function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, setPaused }) {
+function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir, getPaused, setPaused }) {
   const token = process.env.BOT_TOKEN;
   const ownerId = String(process.env.BOT_OWNER_ID || "");
   if (!token || !ownerId) {
@@ -117,10 +117,15 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
     };
   }
   function addSchedule({ groupId, text, mediaPath, scheduleAt, intervalMinutes }) {
-    return db.prepare(`
+    const row = db.prepare(`
       INSERT INTO posts (group_id, text, media_path, schedule_at, interval_minutes, next_run_at, active)
       VALUES (?, ?, ?, ?, ?, ?, 1)
     `).run(groupId, text || "", mediaPath || null, scheduleAt, intervalMinutes || 0, scheduleAt);
+    if (firebaseSync) {
+      const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(row.lastInsertRowid);
+      if (post) firebaseSync.syncPost(post);
+    }
+    return row;
   }
   function helpText() {
     return [
@@ -213,6 +218,7 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
       }
       if (text === "/stop" || text === "🛑 Stop All") {
         db.prepare("UPDATE posts SET active=0 WHERE active=1").run();
+        if (firebaseSync) firebaseSync.syncAllPostsActive(0);
         setPaused(false);
         return say(chatId, "🛑 সব active scheduled post বন্ধ করা হয়েছে।", mainKeyboard);
       }
@@ -224,6 +230,8 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
         if (!username || !/^[a-zA-Z0-9_]{5,}$/.test(username)) return say(chatId, "সঠিক @username বা t.me link দিন।");
         const entity = await getClient().getEntity(username);
         db.prepare("INSERT OR IGNORE INTO groups (username,title) VALUES (?,?)").run(username, entity.title || username);
+        const groupRow = db.prepare("SELECT * FROM groups WHERE username = ?").get(username);
+        if (firebaseSync && groupRow) firebaseSync.syncGroup(groupRow);
         states.delete(String(msg.from.id));
         return say(chatId, `✅ Group যোগ হয়েছে: ${entity.title || username} (@${username})`, mainKeyboard);
       }
@@ -297,6 +305,7 @@ function startControlBot({ db, getClient, isConnected, uploadsDir, getPaused, se
         if (g) {
           db.prepare("DELETE FROM posts WHERE group_id=?").run(id);
           db.prepare("DELETE FROM groups WHERE id=?").run(id);
+          if (firebaseSync) firebaseSync.deleteGroup(id);
         }
         await bot.answerCallbackQuery(query.id, { text: "Group removed" });
         return say(chatId, `Removed ${g ? "@"+g.username : "group"}.`, mainKeyboard);

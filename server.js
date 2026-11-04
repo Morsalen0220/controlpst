@@ -79,6 +79,7 @@ try {
 const API_ID = Number(process.env.API_ID || 0);
 const API_HASH = process.env.API_HASH || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
+const DASHBOARD_SESSION_SECRET = process.env.DASHBOARD_SESSION_SECRET || process.env.SESSION_ENCRYPTION_KEY || "";
 const db = new Database(path.join(DATA_DIR, "data.sqlite"));
 db.pragma("journal_mode = WAL");
 
@@ -134,13 +135,42 @@ let isConnected = false;
 let loginBusy = false;
 let restorePromise = null;
 let automationPaused = false;
+let dataRestoreReady = false;
 
 function requireDashboard(req, res, next) {
   if (!DASHBOARD_PASSWORD) return res.status(503).json({ error: "Set DASHBOARD_PASSWORD in .env before using the dashboard." });
-  const supplied = req.headers["x-dashboard-password"];
-  if (supplied !== DASHBOARD_PASSWORD) return res.status(401).json({ error: "Dashboard password required." });
+  const token = String(req.headers.cookie || "").split(";").map(part => part.trim()).find(part => part.startsWith("dashboard_session="))?.slice("dashboard_session=".length);
+  let validCookie = false;
+  if (token && DASHBOARD_SESSION_SECRET) {
+    try {
+      const [expires, signature] = decodeURIComponent(token).split(".");
+      if (expires && signature && Number(expires) > Date.now()) {
+        const expected = crypto.createHmac("sha256", DASHBOARD_SESSION_SECRET).update(expires).digest("hex");
+        const actualBuffer = Buffer.from(signature, "hex");
+        const expectedBuffer = Buffer.from(expected, "hex");
+        validCookie = actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+      }
+    } catch (_) {}
+  }
+  if (!validCookie) return res.status(401).json({ error: "Dashboard password required." });
   next();
 }
+
+app.post("/auth/login", (req, res) => {
+  if (!DASHBOARD_PASSWORD) return res.status(503).json({ error: "Set DASHBOARD_PASSWORD in .env before using the dashboard." });
+  if (String(req.body?.password || "") !== DASHBOARD_PASSWORD) return res.status(401).json({ error: "Incorrect dashboard password." });
+  if (!DASHBOARD_SESSION_SECRET) return res.status(503).json({ error: "Set SESSION_ENCRYPTION_KEY to enable secure dashboard sessions." });
+  const expires = String(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const signature = crypto.createHmac("sha256", DASHBOARD_SESSION_SECRET).update(expires).digest("hex");
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `dashboard_session=${encodeURIComponent(`${expires}.${signature}`)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secure}`);
+  res.json({ ok: true });
+});
+app.post("/auth/logout", (_req, res) => {
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `dashboard_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`);
+  res.json({ ok: true });
+});
 app.use("/api", requireDashboard);
 
 function ensureConfig() {
@@ -248,6 +278,7 @@ async function connectSavedSession() {
 }
 async function requireTelegram(req, res, next) {
   try {
+    if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
     if (!client || !isConnected) await connectSavedSession();
     if (!client || !isConnected) {
       return res.status(400).json({ error: "Telegram is disconnected. Please connect your account again." });
@@ -270,7 +301,8 @@ app.get("/api/status", async (req, res) => {
     connected: Boolean(client && isConnected),
     phone: pendingLogin?.phone || null,
     firebaseConfigured: Boolean(firebaseSessionRef),
-    firebaseError: firebaseError || null
+    firebaseError: firebaseError || null,
+    dataRestored: dataRestoreReady
   });
 });
 
@@ -352,6 +384,7 @@ app.post("/api/logout", async (req, res) => {
 
 // Groups: add only groups where this account is allowed to post.
 app.get("/api/groups", (req, res) => {
+  if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare("SELECT * FROM groups ORDER BY added_at DESC").all());
 });
 app.post("/api/groups", requireTelegram, async (req, res) => {
@@ -420,6 +453,7 @@ app.post("/api/posts", requireTelegram, upload.single("image"), (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.get("/api/posts", (req, res) => {
+  if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare(`
     SELECT posts.*, groups.title AS group_title, groups.username
     FROM posts JOIN groups ON groups.id = posts.group_id
@@ -442,13 +476,14 @@ app.delete("/api/posts/:id", (req, res) => {
   res.json({ ok: true });
 });
 app.get("/api/history", (req, res) => {
+  if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare("SELECT * FROM history ORDER BY posted_at DESC LIMIT 100").all());
 });
 
 // Scheduler: due items are processed sequentially, not in parallel.
 let schedulerBusy = false;
 async function processDuePosts() {
-  if (schedulerBusy || automationPaused || !client || !isConnected) return;
+  if (!dataRestoreReady || schedulerBusy || automationPaused || !client || !isConnected) return;
   schedulerBusy = true;
   try {
     const now = new Date().toISOString();
@@ -489,11 +524,14 @@ async function processDuePosts() {
     }
   } finally { schedulerBusy = false; }
 }
-setInterval(processDuePosts, 15000);
-
 app.listen(PORT, HOST, async () => {
   console.log(`Dashboard listening on ${HOST}:${PORT}`);
-  await firebaseSync.restoreAllFromFirebase();
+  const restored = await firebaseSync.restoreAllFromFirebase();
+  if (!restored) {
+    firebaseError = firebaseError || "Dashboard data could not be restored from Firebase. Check Firebase credentials, database URL, and rules.";
+  }
+  dataRestoreReady = restored;
+  if (!restored) console.error("[Firebase Sync] Startup is waiting for a successful data restore; scheduled posting remains paused.");
   await connectSavedSession();
   const { startControlBot } = require("./control-bot");
   startControlBot({
@@ -505,4 +543,5 @@ app.listen(PORT, HOST, async () => {
     getPaused: () => automationPaused,
     setPaused: value => { automationPaused = Boolean(value); }
   });
+  setInterval(processDuePosts, 15000);
 });

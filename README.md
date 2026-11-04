@@ -70,4 +70,6 @@ All groups, scheduled posts, post history, uploaded images, and encrypted Telegr
    - `FIREBASE_SERVICE_ACCOUNT_JSON` = the complete contents of the service-account JSON file
    - `SESSION_ENCRYPTION_KEY` = a strong secret; keep the same value permanently
 4. On Render Free, set `DATA_DIR=./data`.
-5. Deploy. When the server starts up, it automatically restores all groups, posts, images, and history from Firebase Realtime Database. Any changes made via the Dashboard or Telegram Bot are instantly backed up to Firebase in real-time.
+5. Deploy. When the server starts up, it restores groups, posts, images, and history from Firebase Realtime Database before scheduled posting begins. Any changes made via the Dashboard or Telegram Bot are backed up to Firebase.
+
+The Telegram session is encrypted with `SESSION_ENCRYPTION_KEY` before it is stored at `private/telegramSession`. Keep that key unchanged across deploys. The dashboard password is exchanged for a signed, HttpOnly browser cookie that lasts seven days; it is not stored in browser JavaScript storage. The cookie works across tabs in the same browser profile. A separate or private/incognito browser profile requires entering the dashboard password once in that profile. Telegram itself does not need to be reconnected as long as Firebase credentials and the encryption key remain valid.

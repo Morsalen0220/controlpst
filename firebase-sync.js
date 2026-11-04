@@ -16,15 +16,15 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
     const root = getRootRef();
     if (!root) {
       console.log("[Firebase Sync] Firebase not configured; skipping cloud restore.");
-      return;
+      return true;
     }
     try {
       console.log("[Firebase Sync] Checking for cloud backup in Firebase Realtime Database...");
       const snapshot = await root.get();
       if (!snapshot.exists()) {
         console.log("[Firebase Sync] No cloud backup found in Firebase yet. Backing up existing local data if any...");
-        backupLocalToFirebase();
-        return;
+        await backupLocalToFirebase();
+        return true;
       }
       const data = snapshot.val() || {};
 
@@ -107,36 +107,39 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
         })(histList);
         console.log(`[Firebase Sync] Restored ${histList.length} history records from Firebase.`);
       }
+      return true;
     } catch (e) {
       console.error("[Firebase Sync] Restore failed:", e.message);
+      return false;
     }
   }
 
-  function backupLocalToFirebase() {
+  async function backupLocalToFirebase() {
     const root = getRootRef();
     if (!root) return;
     try {
       const groups = db.prepare("SELECT * FROM groups").all();
       const posts = db.prepare("SELECT * FROM posts").all();
-      if (!groups.length && !posts.length) return;
+      const history = db.prepare("SELECT * FROM history").all();
+      if (!groups.length && !posts.length && !history.length) return true;
       console.log(`[Firebase Sync] Backing up local data (${groups.length} groups, ${posts.length} posts) to Firebase...`);
-      for (const g of groups) syncGroup(g);
-      for (const p of posts) syncPost(p);
+      await Promise.all([...groups.map(g => syncGroup(g)), ...posts.map(p => syncPost(p))]);
+      await Promise.all(history.map(item => syncHistory(item)));
+      return true;
     } catch (err) {
       console.warn("[Firebase Sync] Local backup error:", err.message);
+      return false;
     }
   }
 
   function syncGroup(group) {
     const root = getRootRef();
     if (!root || !group || !group.id) return;
-    root.child(`groups/${group.id}`).set({
+    return root.child(`groups/${group.id}`).set({
       id: group.id,
       username: group.username,
       title: group.title || group.username,
       added_at: group.added_at || new Date().toISOString()
-    }).catch(err => {
-      console.error("[Firebase Sync] Error syncing group:", err.message);
     });
   }
 
@@ -185,7 +188,7 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
       active: Number(post.active ?? 1),
       created_at: post.created_at || new Date().toISOString()
     };
-    root.child(`posts/${post.id}`).set(payload).catch(err => {
+    return root.child(`posts/${post.id}`).set(payload).catch(err => {
       console.error("[Firebase Sync] Error syncing post:", err.message);
     });
   }
@@ -193,7 +196,7 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
   function syncPostField(id, field, value) {
     const root = getRootRef();
     if (!root || !id) return;
-    root.child(`posts/${id}/${field}`).set(value).catch(err => {
+    return root.child(`posts/${id}/${field}`).set(value).catch(err => {
       console.error(`[Firebase Sync] Error syncing post ${field}:`, err.message);
     });
   }
@@ -209,7 +212,7 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
   function syncHistory(item) {
     const root = getRootRef();
     if (!root || !item || !item.id) return;
-    root.child(`history/${item.id}`).set({
+    return root.child(`history/${item.id}`).set({
       id: item.id,
       post_id: item.post_id || null,
       group_name: item.group_name || "",

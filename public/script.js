@@ -1,20 +1,20 @@
-let password = sessionStorage.getItem("dashpass") || "";
+let authenticated = false;
 const $ = id => document.getElementById(id);
 function toast(msg){const t=$("toast");t.textContent=msg;t.style.display="block";setTimeout(()=>t.style.display="none",3800)}
 async function api(url, options={}) {
-  const headers = {...(options.headers||{}), "x-dashboard-password":password};
-  const r=await fetch(url,{...options,headers});
+  const r=await fetch(url,{...options,credentials:"same-origin"});
   const data=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data.error||"Request failed");
   return data;
 }
 async function unlock(){
-  if(!password){
-    const p=prompt("Enter the dashboard password configured in .env:");
-    if(p===null)return;
-    password=p;sessionStorage.setItem("dashpass",p);
-  }
-  try{await refresh()}catch(e){password="";sessionStorage.removeItem("dashpass");toast(e.message)}
+  const p=prompt("Enter the dashboard password configured on the server:");
+  if(p===null)return;
+  try{
+    await api("/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:p})});
+    authenticated=true;
+    await refresh();
+  }catch(e){authenticated=false;toast(e.message)}
 }
 async function sendCode(){
   try{const d=await api("/api/login/send-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({phone:$("phone").value})});$("verifyBox").classList.remove("hidden");toast(d.message)}catch(e){toast(e.message)}
@@ -25,7 +25,7 @@ async function verifyCode(){
 async function verify2FA(){
   try{const d=await api("/api/login/2fa",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("password").value})});toast(d.message);refresh()}catch(e){toast(e.message)}
 }
-async function logout(){try{await api("/api/logout",{method:"POST"});toast("Logged out");refresh()}catch(e){toast(e.message)}}
+async function logout(){try{await api("/auth/logout",{method:"POST"});authenticated=false;toast("Dashboard session ended");unlock()}catch(e){toast(e.message)}}
 async function addGroup(){
   try{const d=await api("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("groupName").value})});$("groupName").value="";toast("Group added: "+(d.title||d.username));refresh()}catch(e){toast(e.message)}
 }
@@ -50,7 +50,7 @@ async function refresh(){
     $("targetGroup").innerHTML='<option value="">Select a group</option>'+groups.map(g=>`<option value="${g.id}">${esc(g.title||g.username)} (@${esc(g.username)})</option>`).join("");
     $("postsList").innerHTML=posts.length?`<table><thead><tr><th>Group</th><th>Content</th><th>Next run</th><th>Repeat</th><th>Status</th><th>Actions</th></tr></thead><tbody>${posts.map(p=>`<tr><td>@${esc(p.username)}</td><td>${esc((p.text||"Image post").slice(0,55))}</td><td>${fmt(p.next_run_at)}</td><td>${p.interval_minutes?p.interval_minutes+" min":"Once"}</td><td><span class="pill ${p.active?"success":""}">${p.active?"Active":"Paused / done"}</span></td><td><button class="ghost" onclick="togglePost(${p.id})">${p.active?"Pause":"Resume"}</button> <button class="danger" onclick="deletePost(${p.id})">Delete</button></td></tr>`).join("")}</tbody></table>`:'<div class="empty">No scheduled posts yet.</div>';
     $("historyList").innerHTML=history.length?`<table><thead><tr><th>Time</th><th>Group</th><th>Result</th><th>Details</th></tr></thead><tbody>${history.map(h=>`<tr><td>${fmt(h.posted_at)}</td><td>@${esc(h.group_name)}</td><td><span class="pill ${h.result==="SUCCESS"?"success":"failed"}">${esc(h.result)}</span></td><td>${esc(h.detail)}</td></tr>`).join("")}</tbody></table>`:'<div class="empty">No posting activity yet.</div>';
-  }catch(e){if(e.message.includes("password")){password="";sessionStorage.removeItem("dashpass");unlock()}else toast(e.message)}
+  }catch(e){if(e.message.toLowerCase().includes("password")){authenticated=false;unlock()}else toast(e.message)}
 }
 $("postForm").addEventListener("submit",async e=>{
   e.preventDefault();
@@ -75,4 +75,4 @@ $("postForm").addEventListener("submit",async e=>{
 });
 const dt=new Date(Date.now()-new Date().getTimezoneOffset()*60000);$("scheduleAt").value=dt.toISOString().slice(0,16);
 unlock();
-setInterval(()=>{if(password)refresh()},30000);
+setInterval(()=>{if(authenticated)refresh()},30000);

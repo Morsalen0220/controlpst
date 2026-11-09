@@ -17,17 +17,17 @@ async function unlock(){
   }catch(e){authenticated=false;toast(e.message)}
 }
 async function sendCode(){
-  try{const d=await api("/api/login/send-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:Number($("loginAccount").value),phone:$("phone").value})});$("verifyBox").classList.remove("hidden");toast(d.message)}catch(e){toast(e.message)}
+  try{const d=await api("/api/login/send-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:Number($("loginAccount")?.value||1),phone:$("phone").value})});$("verifyBox").classList.remove("hidden");toast(d.message)}catch(e){toast(e.message)}
 }
 async function verifyCode(){
-  try{const d=await api("/api/login/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("code").value})});if(d.needs2FA){toast(d.message);return}toast(d.message);refresh()}catch(e){toast(e.message)}
+  try{const d=await api("/api/login/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("code").value})});if(d.needs2FA){toast(d.message);return}$("verifyBox").classList.add("hidden");$("phone").value="";$("code").value="";$("password").value="";toast(d.message);refresh()}catch(e){toast(e.message)}
 }
 async function verify2FA(){
-  try{const d=await api("/api/login/2fa",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("password").value})});toast(d.message);refresh()}catch(e){toast(e.message)}
+  try{const d=await api("/api/login/2fa",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("password").value})});$("verifyBox").classList.add("hidden");$("phone").value="";$("code").value="";$("password").value="";toast(d.message);refresh()}catch(e){toast(e.message)}
 }
 async function logout(){try{await api("/auth/logout",{method:"POST"});authenticated=false;toast("Dashboard session ended");unlock()}catch(e){toast(e.message)}}
 async function addGroup(){
-  try{const d=await api("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:Number($("groupAccount").value),username:$("groupName").value})});$("groupName").value="";toast("Group added: "+(d.title||d.username));refresh()}catch(e){toast(e.message)}
+  try{const d=await api("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:Number($("groupAccount")?.value||1),username:$("groupName").value})});$("groupName").value="";toast("Group added: "+(d.title||d.username));refresh()}catch(e){toast(e.message)}
 }
 async function removeGroup(id){if(!confirm("Remove this group and its scheduled posts?"))return;try{await api("/api/groups/"+id,{method:"DELETE"});refresh()}catch(e){toast(e.message)}}
 async function togglePost(id){try{await api("/api/posts/"+id+"/toggle",{method:"POST"});refresh()}catch(e){toast(e.message)}}
@@ -47,6 +47,7 @@ function ensureMultiAccountDOM(){
     lbl.textContent="Account slot";
     const sel=document.createElement("select");
     sel.id="loginAccount";
+    sel.innerHTML='<option value="1">Account 1</option><option value="2">Account 2</option>';
     loginForm.insertBefore(sel,loginForm.firstChild);
     loginForm.insertBefore(lbl,sel);
   }
@@ -59,6 +60,7 @@ function ensureMultiAccountDOM(){
     lbl.textContent="Telegram account";
     const sel=document.createElement("select");
     sel.id="groupAccount";
+    sel.innerHTML='<option value="1">Account 1</option><option value="2">Account 2</option>';
     target.parentNode.insertBefore(lbl,target);
     target.parentNode.insertBefore(sel,target);
   }
@@ -88,7 +90,7 @@ async function refresh(){
     accountsCache=Array.isArray(status.accounts)&&status.accounts.length?status.accounts:[{id:1,label:"",phone:"",connected:Boolean(status.connected)},{id:2,label:"",phone:"",connected:false}];
     const connectedCount=accountsCache.filter(a=>a.connected).length;
     $("statAccount").textContent=connectedCount?connectedCount+" / "+accountsCache.length+" connected":"Not connected";
-    if($("accountCards"))$("accountCards").innerHTML=accountsCache.map(a=>`<div class="list-row"><div><b>Account ${a.id}</b><small>${a.connected?esc((a.label||"Connected")+(a.phone?" · "+a.phone:"")):"Not connected"}</small></div>${a.connected?`<button class="danger" onclick="disconnectAccount(${a.id})">Disconnect</button>`:'<span class="pill">Offline</span>'}</div>`).join("");
+    if($("accountCards"))$("accountCards").innerHTML=accountsCache.map(a=>`<div class="list-row"><div><b>Account ${a.id}</b><small>${a.connected?esc((a.label||"Connected")+(a.phone?" · "+a.phone:"")):esc(a.error||"Not connected")}</small></div>${a.connected?`<button class="danger" onclick="disconnectAccount(${a.id})">Disconnect</button>`:'<span class="pill">Offline</span>'}</div>`).join("");
     fillSelect($("loginAccount"),accountsCache.map(a=>`<option value="${a.id}">Account ${a.id}${a.connected?" (connected"+(a.label?": "+esc(a.label):"")+")":" (not connected)"}</option>`).join(""));
     fillSelect($("groupAccount"),accountsCache.map(a=>`<option value="${a.id}"${a.connected?"":" disabled"}>${esc(accName(a.id))}${a.connected?"":" (not connected)"}</option>`).join(""));
     if($("groupAccount")&&!$("groupAccount").value){const first=accountsCache.find(a=>a.connected);if(first)$("groupAccount").value=String(first.id)}

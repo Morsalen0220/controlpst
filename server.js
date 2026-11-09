@@ -47,8 +47,8 @@ function parseServiceAccount(raw) {
 }
 
 try {
-  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  let databaseURL = String(process.env.FIREBASE_DATABASE_URL || "").trim().replace(/^['"]|['"]$/g, "");
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+  let databaseURL = String(process.env.FIREBASE_DATABASE_URL || process.env.FIREBASE_DB_URL || "").trim().replace(/^['"]|['"]$/g, "");
   if (serviceAccountJson) {
     const serviceAccount = parseServiceAccount(serviceAccountJson);
     if (!databaseURL && serviceAccount.project_id) {
@@ -157,6 +157,7 @@ const upload = multer({
 
 const clients = new Map(); // account id -> connected TelegramClient
 const restorePromises = new Map();
+const accountErrors = new Map(); // account id -> last restore/connection status message
 let pendingLogin = null;
 let loginBusy = false;
 let automationPaused = false;
@@ -229,7 +230,7 @@ function decryptSession(encoded) {
 }
 
 function parseAccountId(value) {
-  const id = Number(value);
+  const id = Number(value || 1);
   if (!Number.isInteger(id) || id < 1 || id > MAX_ACCOUNTS) throw new Error(`Choose a valid account (1-${MAX_ACCOUNTS}).`);
   return id;
 }
@@ -241,9 +242,13 @@ function sessionRef(id) {
 }
 async function saveEncryptedSession(id, sessionString) {
   const encrypted = encryptSession(sessionString);
+  const payload = { encrypted, updatedAt: new Date().toISOString(), version: 2 };
   const ref = sessionRef(id);
   if (ref) {
-    await ref.set({ encrypted, updatedAt: new Date().toISOString(), version: 2 });
+    await ref.set(payload);
+    if (id === 1 && firebaseSessionRef) {
+      try { await firebaseSessionRef.set(payload); } catch (_) {}
+    }
     console.log(`Encrypted Telegram session for account ${id} saved to Firebase Realtime Database.`);
     return;
   }
@@ -255,12 +260,14 @@ async function saveEncryptedSession(id, sessionString) {
   console.warn(`Telegram session for account ${id} saved locally only; configure Firebase for Render Free persistence.`);
 }
 async function readEncryptedSession(id) {
+  let decryptErr = null;
   const ref = sessionRef(id);
   if (ref) {
     try {
       const value = (await ref.get()).val();
       if (value && value.encrypted) return decryptSession(value.encrypted);
     } catch (e) {
+      decryptErr = e;
       console.warn(`Could not read session from telegramSessions/${id}:`, e.message);
     }
     if (id === 1 && firebaseSessionRef) {
@@ -275,6 +282,7 @@ async function readEncryptedSession(id) {
           return decrypted;
         }
       } catch (e) {
+        decryptErr = e;
         console.warn("Could not read legacy session from telegramSession:", e.message);
       }
     }
@@ -284,8 +292,12 @@ async function readEncryptedSession(id) {
     try {
       return decryptSession(fs.readFileSync(file, "utf8"));
     } catch (e) {
+      decryptErr = e;
       console.warn(`Could not read local session file for account ${id}:`, e.message);
     }
+  }
+  if (decryptErr) {
+    accountErrors.set(id, "Saved session could not be decrypted (SESSION_ENCRYPTION_KEY changed). Please log in again.");
   }
   return "";
 }
@@ -317,6 +329,7 @@ async function activateAccount(id, tgClient) {
   await saveEncryptedSession(id, sessionString);
   const old = clients.get(id);
   clients.set(id, tgClient);
+  accountErrors.delete(id);
   if (old && old !== tgClient) { try { await old.disconnect(); } catch (_) {} }
   await syncAccountProfile(id, tgClient);
 }
@@ -328,8 +341,12 @@ async function connectSavedSession(id) {
   const promise = (async () => {
     let restoredClient = null;
     try {
+      accountErrors.delete(id);
       const savedSession = (id === 1 && process.env.SESSION_STRING) || await readEncryptedSession(id);
       if (!savedSession) {
+        if (!accountErrors.has(id)) {
+          accountErrors.set(id, "Not logged in yet");
+        }
         console.log(`No saved Telegram session for account ${id}; login is required.`);
         return false;
       }
@@ -337,10 +354,12 @@ async function connectSavedSession(id) {
       await restoredClient.connect();
       if (!(await restoredClient.checkAuthorization())) {
         await restoredClient.disconnect();
+        accountErrors.set(id, "Telegram session expired or logged out — please log in again");
         console.warn(`Saved Telegram session for account ${id} is no longer authorized.`);
         return false;
       }
       clients.set(id, restoredClient);
+      accountErrors.delete(id);
       const existingAcc = db.prepare("SELECT * FROM accounts WHERE id = ?").get(id);
       if (!existingAcc || !existingAcc.label) {
         await syncAccountProfile(id, restoredClient);
@@ -349,6 +368,7 @@ async function connectSavedSession(id) {
       return true;
     } catch (e) {
       console.error(`Saved Telegram session for account ${id} could not be restored:`, e.message);
+      accountErrors.set(id, e.message || "Could not restore session");
       if (restoredClient) { try { await restoredClient.disconnect(); } catch (_) {} }
       clients.delete(id);
       return false;
@@ -368,7 +388,13 @@ function accountList() {
   return Array.from({ length: MAX_ACCOUNTS }, (_, i) => {
     const id = i + 1;
     const row = rows.find(r => r.id === id);
-    return { id, label: row?.label || "", phone: row?.phone || "", connected: clients.has(id) };
+    return {
+      id,
+      label: row?.label || "",
+      phone: row?.phone || "",
+      connected: clients.has(id),
+      error: clients.has(id) ? null : (accountErrors.get(id) || null)
+    };
   });
 }
 // Resolve the Telegram client for an account, restoring a saved session if needed.
@@ -432,12 +458,16 @@ app.post("/api/login/send-code", async (req, res) => {
     const accountId = parseAccountId(req.body.account_id);
     const phone = String(req.body.phone || "").trim();
     if (!phone.startsWith("+")) return res.status(400).json({ error: "Use international format, e.g. +8801XXXXXXXXX." });
-    if (loginBusy) return res.status(409).json({ error: "A login attempt is already in progress." });
+    if (pendingLogin?.temp) {
+      try { await pendingLogin.temp.disconnect(); } catch (_) {}
+      pendingLogin = null;
+    }
     loginBusy = true;
     const temp = createClient();
     await temp.connect();
     const sent = await temp.sendCode({ apiId: API_ID, apiHash: API_HASH }, phone);
     pendingLogin = { accountId, temp, phone, phoneCodeHash: sent.phoneCodeHash };
+    loginBusy = false;
     res.json({ ok: true, message: `Telegram login code sent for Account ${accountId}. Enter it in the dashboard.` });
   } catch (e) {
     loginBusy = false;
@@ -675,3 +705,12 @@ app.listen(PORT, HOST, async () => {
   });
   setInterval(processDuePosts, 15000);
 });
+
+async function gracefulShutdown() {
+  for (const [, c] of clients) {
+    try { await c.disconnect(); } catch (_) {}
+  }
+  process.exit(0);
+}
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);

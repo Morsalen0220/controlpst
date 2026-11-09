@@ -254,10 +254,17 @@ async function readEncryptedSession(id) {
   if (ref) {
     const value = (await ref.get()).val();
     if (value && value.encrypted) return decryptSession(value.encrypted);
-    if (id === 1) {
-      // Legacy single-account location.
+    if (id === 1 && firebaseSessionRef) {
+      // Legacy single-account location: private/telegramSession
       const legacy = (await firebaseSessionRef.get()).val();
-      if (legacy && legacy.encrypted) return decryptSession(legacy.encrypted);
+      if (legacy && legacy.encrypted) {
+        const decrypted = decryptSession(legacy.encrypted);
+        // Copy to new multi-account location while keeping legacy intact
+        try {
+          await ref.set({ encrypted: legacy.encrypted, updatedAt: new Date().toISOString(), version: 2 });
+        } catch (_) {}
+        return decrypted;
+      }
     }
   }
   const file = sessionFile(id);
@@ -272,13 +279,7 @@ async function removeStoredSession(id) {
   if (fs.existsSync(file)) fs.unlinkSync(file);
 }
 
-async function activateAccount(id, tgClient) {
-  const sessionString = tgClient?.session?.save?.() || "";
-  if (!sessionString) throw new Error("Telegram session is empty; cannot persist login.");
-  await saveEncryptedSession(id, sessionString);
-  const old = clients.get(id);
-  clients.set(id, tgClient);
-  if (old && old !== tgClient) { try { await old.disconnect(); } catch (_) {} }
+async function syncAccountProfile(id, tgClient) {
   try {
     const me = await tgClient.getMe();
     const name = [me.firstName, me.lastName].filter(Boolean).join(" ") || me.username || `Account ${id}`;
@@ -290,6 +291,16 @@ async function activateAccount(id, tgClient) {
   } catch (e) {
     console.warn(`Could not read profile for account ${id}:`, e.message);
   }
+}
+
+async function activateAccount(id, tgClient) {
+  const sessionString = tgClient?.session?.save?.() || "";
+  if (!sessionString) throw new Error("Telegram session is empty; cannot persist login.");
+  await saveEncryptedSession(id, sessionString);
+  const old = clients.get(id);
+  clients.set(id, tgClient);
+  if (old && old !== tgClient) { try { await old.disconnect(); } catch (_) {} }
+  await syncAccountProfile(id, tgClient);
 }
 
 async function connectSavedSession(id) {
@@ -312,6 +323,10 @@ async function connectSavedSession(id) {
         return false;
       }
       clients.set(id, restoredClient);
+      const existingAcc = db.prepare("SELECT * FROM accounts WHERE id = ?").get(id);
+      if (!existingAcc || !existingAcc.label) {
+        await syncAccountProfile(id, restoredClient);
+      }
       console.log(`Saved Telegram session for account ${id} restored successfully.`);
       return true;
     } catch (e) {
@@ -350,10 +365,32 @@ function normalizeUsername(value) {
   return String(value || "").trim().replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "").replace(/\/.*$/, "");
 }
 
+let restoreDataPromise = null;
+async function ensureDataRestored() {
+  if (dataRestoreReady) return true;
+  if (restoreDataPromise) return restoreDataPromise;
+  restoreDataPromise = (async () => {
+    try {
+      const restored = await firebaseSync.restoreAllFromFirebase();
+      if (restored) {
+        dataRestoreReady = true;
+        firebaseError = null;
+      } else {
+        firebaseError = firebaseError || "Dashboard data could not be restored from Firebase. Check Firebase credentials, database URL, and rules.";
+      }
+      return restored;
+    } finally {
+      restoreDataPromise = null;
+    }
+  })();
+  return restoreDataPromise;
+}
+
 // Account status
 app.get("/api/status", async (req, res) => {
-  // Wait for session restoration before reporting status. This avoids a false
-  // "Disconnected" immediately after a Render restart or a new page load.
+  // Wait for data & session restoration before reporting status. This avoids a false
+  // "Disconnected" or empty groups immediately after a Render restart or a new page load.
+  await ensureDataRestored();
   await connectAllSavedSessions();
   res.json({
     connected: anyConnected(),
@@ -442,7 +479,8 @@ app.post("/api/logout", async (req, res) => {
 });
 
 // Groups: each group belongs to one Telegram account; add only groups where that account may post.
-app.get("/api/groups", (req, res) => {
+app.get("/api/groups", async (req, res) => {
+  await ensureDataRestored();
   if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare("SELECT * FROM groups ORDER BY account_id, added_at DESC").all());
 });
@@ -514,7 +552,8 @@ app.post("/api/posts", upload.single("image"), async (req, res) => {
     res.json({ ok: true, id: row.lastInsertRowid });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-app.get("/api/posts", (req, res) => {
+app.get("/api/posts", async (req, res) => {
+  await ensureDataRestored();
   if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare(`
     SELECT posts.*, groups.title AS group_title, groups.username, groups.account_id
@@ -537,7 +576,8 @@ app.delete("/api/posts/:id", (req, res) => {
   firebaseSync.deletePost(id);
   res.json({ ok: true });
 });
-app.get("/api/history", (req, res) => {
+app.get("/api/history", async (req, res) => {
+  await ensureDataRestored();
   if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare("SELECT * FROM history ORDER BY posted_at DESC LIMIT 100").all());
 });
@@ -545,9 +585,15 @@ app.get("/api/history", (req, res) => {
 // Scheduler: due items are processed sequentially, not in parallel.
 let schedulerBusy = false;
 async function processDuePosts() {
-  if (!dataRestoreReady || schedulerBusy || automationPaused || !clients.size) return;
+  if (schedulerBusy || automationPaused) return;
   schedulerBusy = true;
   try {
+    if (!dataRestoreReady) await ensureDataRestored();
+    if (!dataRestoreReady) return;
+    if (clients.size < MAX_ACCOUNTS) {
+      await connectAllSavedSessions();
+    }
+    if (!clients.size) return;
     const now = new Date().toISOString();
     const due = db.prepare(`
       SELECT posts.*, groups.username, groups.account_id
@@ -590,11 +636,7 @@ async function processDuePosts() {
 }
 app.listen(PORT, HOST, async () => {
   console.log(`Dashboard listening on ${HOST}:${PORT}`);
-  const restored = await firebaseSync.restoreAllFromFirebase();
-  if (!restored) {
-    firebaseError = firebaseError || "Dashboard data could not be restored from Firebase. Check Firebase credentials, database URL, and rules.";
-  }
-  dataRestoreReady = restored;
+  const restored = await ensureDataRestored();
   if (!restored) console.error("[Firebase Sync] Startup is waiting for a successful data restore; scheduled posting remains paused.");
   await connectAllSavedSessions();
   const { startControlBot } = require("./control-bot");

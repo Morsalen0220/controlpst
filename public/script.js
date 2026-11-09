@@ -47,8 +47,14 @@ function fmt(s){
 }
 async function refresh(){
   try{
-    const [status,groups,posts,history]=await Promise.all([api("/api/status"),api("/api/groups"),api("/api/posts"),api("/api/history")]);
+    const status=await api("/api/status");
+    const [groups,posts,history]=await Promise.all([
+      api("/api/groups").catch(()=>[]),
+      api("/api/posts").catch(()=>[]),
+      api("/api/history").catch(()=>[])
+    ]);
     $("status").className="badge "+(status.connected?"on":"off");$("status").textContent=status.connected?"● Connected":"● Disconnected";
+    if(status.firebaseError){toast("Firebase: "+status.firebaseError)}
     accountsCache=status.accounts||[];
     const connectedCount=accountsCache.filter(a=>a.connected).length;
     $("statAccount").textContent=connectedCount?connectedCount+" / "+accountsCache.length+" connected":"Not connected";

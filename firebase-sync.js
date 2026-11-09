@@ -31,9 +31,10 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
       // 0. Restore account labels
       if (data.accounts) {
         const insertAccount = db.prepare("INSERT OR REPLACE INTO accounts (id, label, phone, updated_at) VALUES (@id, @label, @phone, @updated_at)");
+        const accountList = Object.values(data.accounts).filter(a => a && a.id);
         db.transaction((items) => {
-          for (const a of items) insertAccount.run({ id: a.id, label: a.label || "", phone: a.phone || "", updated_at: a.updated_at || new Date().toISOString() });
-        })(Object.values(data.accounts));
+          for (const a of items) insertAccount.run({ id: Number(a.id), label: a.label || "", phone: a.phone || "", updated_at: a.updated_at || new Date().toISOString() });
+        })(accountList);
       }
 
       // 1. Restore Groups
@@ -42,11 +43,11 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
           INSERT OR REPLACE INTO groups (id, account_id, username, title, added_at)
           VALUES (@id, @account_id, @username, @title, @added_at)
         `);
-        const groupList = Object.values(data.groups);
+        const groupList = Object.values(data.groups).filter(g => g && g.id && g.username);
         db.transaction((items) => {
           for (const g of items) {
             insertGroup.run({
-              id: g.id,
+              id: Number(g.id),
               account_id: Number(g.account_id || 1),
               username: g.username,
               title: g.title || g.username,
@@ -63,35 +64,40 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
           INSERT OR REPLACE INTO posts (id, group_id, text, media_path, schedule_at, interval_minutes, next_run_at, active, created_at)
           VALUES (@id, @group_id, @text, @media_path, @schedule_at, @interval_minutes, @next_run_at, @active, @created_at)
         `);
-        const postList = Object.values(data.posts);
-        db.transaction((items) => {
-          for (const p of items) {
-            let localMediaPath = p.media_path || null;
-            if (p.media_base64) {
-              const filename = p.media_filename || `restored_${p.id}.jpg`;
-              localMediaPath = path.join(uploadsDir, filename);
-              try {
-                fs.mkdirSync(uploadsDir, { recursive: true });
-                if (!fs.existsSync(localMediaPath)) {
-                  fs.writeFileSync(localMediaPath, Buffer.from(p.media_base64, "base64"));
+        const postList = Object.values(data.posts).filter(p => p && p.id && p.group_id);
+        db.pragma("foreign_keys = OFF");
+        try {
+          db.transaction((items) => {
+            for (const p of items) {
+              let localMediaPath = p.media_path || null;
+              if (p.media_base64) {
+                const filename = p.media_filename || `restored_${p.id}.jpg`;
+                localMediaPath = path.join(uploadsDir, filename);
+                try {
+                  fs.mkdirSync(uploadsDir, { recursive: true });
+                  if (!fs.existsSync(localMediaPath)) {
+                    fs.writeFileSync(localMediaPath, Buffer.from(p.media_base64, "base64"));
+                  }
+                } catch (err) {
+                  console.warn("[Firebase Sync] Error restoring image file:", err.message);
                 }
-              } catch (err) {
-                console.warn("[Firebase Sync] Error restoring image file:", err.message);
               }
+              insertPost.run({
+                id: Number(p.id),
+                group_id: Number(p.group_id),
+                text: p.text || "",
+                media_path: localMediaPath,
+                schedule_at: p.schedule_at,
+                interval_minutes: Number(p.interval_minutes || 0),
+                next_run_at: p.next_run_at,
+                active: Number(p.active ?? 1),
+                created_at: p.created_at || new Date().toISOString()
+              });
             }
-            insertPost.run({
-              id: p.id,
-              group_id: p.group_id,
-              text: p.text || "",
-              media_path: localMediaPath,
-              schedule_at: p.schedule_at,
-              interval_minutes: Number(p.interval_minutes || 0),
-              next_run_at: p.next_run_at,
-              active: Number(p.active ?? 1),
-              created_at: p.created_at || new Date().toISOString()
-            });
-          }
-        })(postList);
+          })(postList);
+        } finally {
+          db.pragma("foreign_keys = ON");
+        }
         console.log(`[Firebase Sync] Restored ${postList.length} scheduled posts from Firebase.`);
       }
 
@@ -101,11 +107,11 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
           INSERT OR REPLACE INTO history (id, post_id, group_name, result, detail, posted_at)
           VALUES (@id, @post_id, @group_name, @result, @detail, @posted_at)
         `);
-        const histList = Object.values(data.history);
+        const histList = Object.values(data.history).filter(h => h && h.id);
         db.transaction((items) => {
           for (const h of items) {
             insertHistory.run({
-              id: h.id,
+              id: Number(h.id),
               post_id: h.post_id || null,
               group_name: h.group_name || "",
               result: h.result || "SUCCESS",

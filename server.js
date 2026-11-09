@@ -83,13 +83,23 @@ const DASHBOARD_SESSION_SECRET = process.env.DASHBOARD_SESSION_SECRET || process
 const db = new Database(path.join(DATA_DIR, "data.sqlite"));
 db.pragma("journal_mode = WAL");
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS groups (
+const MAX_ACCOUNTS = Math.max(1, Number(process.env.MAX_ACCOUNTS || 2));
+const GROUPS_SCHEMA = `(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
+  account_id INTEGER NOT NULL DEFAULT 1,
+  username TEXT NOT NULL,
   title TEXT,
-  added_at TEXT DEFAULT CURRENT_TIMESTAMP
+  added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(account_id, username)
+)`;
+db.exec(`
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY,
+  label TEXT,
+  phone TEXT,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS groups ${GROUPS_SCHEMA};
 CREATE TABLE IF NOT EXISTS posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id INTEGER NOT NULL,
@@ -111,6 +121,17 @@ CREATE TABLE IF NOT EXISTS history (
   posted_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 `);
+// Migrate single-account databases: existing groups belong to account 1.
+if (!db.prepare("PRAGMA table_info(groups)").all().some(c => c.name === "account_id")) {
+  db.pragma("foreign_keys = OFF");
+  db.transaction(() => {
+    db.exec(`CREATE TABLE groups_new ${GROUPS_SCHEMA};
+      INSERT INTO groups_new (id, username, title, added_at) SELECT id, username, title, added_at FROM groups;
+      DROP TABLE groups;
+      ALTER TABLE groups_new RENAME TO groups;`);
+  })();
+  db.pragma("foreign_keys = ON");
+}
 
 const { createFirebaseSync } = require("./firebase-sync");
 const firebaseSync = createFirebaseSync({
@@ -129,11 +150,10 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }
 });
 
-let client = null;
+const clients = new Map(); // account id -> connected TelegramClient
+const restorePromises = new Map();
 let pendingLogin = null;
-let isConnected = false;
 let loginBusy = false;
-let restorePromise = null;
 let automationPaused = false;
 let dataRestoreReady = false;
 
@@ -202,91 +222,129 @@ function decryptSession(encoded) {
   decipher.setAuthTag(raw.subarray(12, 28));
   return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString("utf8");
 }
-async function saveEncryptedSession(sessionString) {
+
+function parseAccountId(value) {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id < 1 || id > MAX_ACCOUNTS) throw new Error(`Choose a valid account (1-${MAX_ACCOUNTS}).`);
+  return id;
+}
+function sessionFile(id) {
+  return id === 1 ? SESSION_FILE : path.join(DATA_DIR, `telegram-session-${id}.enc`);
+}
+function sessionRef(id) {
+  return firebaseSessionRef ? admin.database().ref(`private/telegramSessions/${id}`) : null;
+}
+async function saveEncryptedSession(id, sessionString) {
   const encrypted = encryptSession(sessionString);
-  if (firebaseSessionRef) {
-    await firebaseSessionRef.set({
-      encrypted,
-      updatedAt: new Date().toISOString(),
-      version: 1
-    });
-    console.log("Encrypted Telegram session saved to Firebase Realtime Database.");
+  const ref = sessionRef(id);
+  if (ref) {
+    await ref.set({ encrypted, updatedAt: new Date().toISOString(), version: 2 });
+    console.log(`Encrypted Telegram session for account ${id} saved to Firebase Realtime Database.`);
     return;
   }
   // Local fallback is useful for development, but is not persistent on Render Free.
-  const tempFile = SESSION_FILE + ".tmp";
+  const file = sessionFile(id);
+  const tempFile = file + ".tmp";
   fs.writeFileSync(tempFile, Buffer.from(encrypted, "utf8"), { mode: 0o600 });
-  fs.renameSync(tempFile, SESSION_FILE);
-  console.warn("Telegram session saved locally only; configure Firebase for Render Free persistence.");
+  fs.renameSync(tempFile, file);
+  console.warn(`Telegram session for account ${id} saved locally only; configure Firebase for Render Free persistence.`);
 }
-async function readEncryptedSession() {
-  if (firebaseSessionRef) {
-    const snapshot = await firebaseSessionRef.get();
-    const value = snapshot.val();
+async function readEncryptedSession(id) {
+  const ref = sessionRef(id);
+  if (ref) {
+    const value = (await ref.get()).val();
     if (value && value.encrypted) return decryptSession(value.encrypted);
+    if (id === 1) {
+      // Legacy single-account location.
+      const legacy = (await firebaseSessionRef.get()).val();
+      if (legacy && legacy.encrypted) return decryptSession(legacy.encrypted);
+    }
   }
-  if (!fs.existsSync(SESSION_FILE)) return "";
-  return decryptSession(fs.readFileSync(SESSION_FILE, "utf8"));
+  const file = sessionFile(id);
+  if (!fs.existsSync(file)) return "";
+  return decryptSession(fs.readFileSync(file, "utf8"));
 }
-async function persistCurrentSession() {
-  const sessionString = client?.session?.save?.() || "";
+async function removeStoredSession(id) {
+  const ref = sessionRef(id);
+  if (ref) await ref.remove();
+  if (id === 1 && firebaseSessionRef) await firebaseSessionRef.remove();
+  const file = sessionFile(id);
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+}
+
+async function activateAccount(id, tgClient) {
+  const sessionString = tgClient?.session?.save?.() || "";
   if (!sessionString) throw new Error("Telegram session is empty; cannot persist login.");
-  await saveEncryptedSession(sessionString);
+  await saveEncryptedSession(id, sessionString);
+  const old = clients.get(id);
+  clients.set(id, tgClient);
+  if (old && old !== tgClient) { try { await old.disconnect(); } catch (_) {} }
+  try {
+    const me = await tgClient.getMe();
+    const name = [me.firstName, me.lastName].filter(Boolean).join(" ") || me.username || `Account ${id}`;
+    const phone = me.phone ? "+" + me.phone : "";
+    db.prepare(`INSERT INTO accounts (id, label, phone, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET label = excluded.label, phone = excluded.phone, updated_at = excluded.updated_at`)
+      .run(id, name, phone, new Date().toISOString());
+    firebaseSync.syncAccount(db.prepare("SELECT * FROM accounts WHERE id = ?").get(id));
+  } catch (e) {
+    console.warn(`Could not read profile for account ${id}:`, e.message);
+  }
 }
 
-async function connectSavedSession() {
-  if (client && isConnected) return true;
-  if (restorePromise) return restorePromise;
+async function connectSavedSession(id) {
+  if (clients.has(id)) return true;
+  if (restorePromises.has(id)) return restorePromises.get(id);
 
-  restorePromise = (async () => {
+  const promise = (async () => {
     let restoredClient = null;
     try {
-      const savedSession = process.env.SESSION_STRING || await readEncryptedSession();
+      const savedSession = (id === 1 && process.env.SESSION_STRING) || await readEncryptedSession(id);
       if (!savedSession) {
-        console.log("No saved Telegram session found; login is required.");
+        console.log(`No saved Telegram session for account ${id}; login is required.`);
         return false;
       }
-
       restoredClient = createClient(savedSession);
       await restoredClient.connect();
-      const authorized = await restoredClient.checkAuthorization();
-
-      if (!authorized) {
+      if (!(await restoredClient.checkAuthorization())) {
         await restoredClient.disconnect();
-        console.warn("Saved Telegram session is no longer authorized.");
+        console.warn(`Saved Telegram session for account ${id} is no longer authorized.`);
         return false;
       }
-
-      client = restoredClient;
-      isConnected = true;
-      console.log("Saved Telegram session restored successfully.");
+      clients.set(id, restoredClient);
+      console.log(`Saved Telegram session for account ${id} restored successfully.`);
       return true;
     } catch (e) {
-      console.error("Saved Telegram session could not be restored:", e.message);
-      if (restoredClient) {
-        try { await restoredClient.disconnect(); } catch (_) {}
-      }
-      client = null;
-      isConnected = false;
+      console.error(`Saved Telegram session for account ${id} could not be restored:`, e.message);
+      if (restoredClient) { try { await restoredClient.disconnect(); } catch (_) {} }
+      clients.delete(id);
       return false;
     } finally {
-      restorePromise = null;
+      restorePromises.delete(id);
     }
   })();
-
-  return restorePromise;
+  restorePromises.set(id, promise);
+  return promise;
 }
-async function requireTelegram(req, res, next) {
-  try {
-    if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
-    if (!client || !isConnected) await connectSavedSession();
-    if (!client || !isConnected) {
-      return res.status(400).json({ error: "Telegram is disconnected. Please connect your account again." });
-    }
-    next();
-  } catch (e) {
-    res.status(503).json({ error: "Could not restore Telegram connection: " + e.message });
-  }
+async function connectAllSavedSessions() {
+  for (let id = 1; id <= MAX_ACCOUNTS; id++) await connectSavedSession(id);
+}
+function anyConnected() { return clients.size > 0; }
+function accountList() {
+  const rows = db.prepare("SELECT * FROM accounts").all();
+  return Array.from({ length: MAX_ACCOUNTS }, (_, i) => {
+    const id = i + 1;
+    const row = rows.find(r => r.id === id);
+    return { id, label: row?.label || "", phone: row?.phone || "", connected: clients.has(id) };
+  });
+}
+// Resolve the Telegram client for an account, restoring a saved session if needed.
+async function getAccountClient(id) {
+  if (!dataRestoreReady) throw new Error("Stored dashboard data is still restoring. Try again shortly.");
+  if (!clients.has(id)) await connectSavedSession(id);
+  const c = clients.get(id);
+  if (!c) throw new Error(`Telegram account ${id} is disconnected. Please connect it again.`);
+  return c;
 }
 function normalizeUsername(value) {
   return String(value || "").trim().replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "").replace(/\/.*$/, "");
@@ -296,9 +354,11 @@ function normalizeUsername(value) {
 app.get("/api/status", async (req, res) => {
   // Wait for session restoration before reporting status. This avoids a false
   // "Disconnected" immediately after a Render restart or a new page load.
-  if (!client || !isConnected) await connectSavedSession();
+  await connectAllSavedSessions();
   res.json({
-    connected: Boolean(client && isConnected),
+    connected: anyConnected(),
+    accounts: accountList(),
+    pendingAccount: pendingLogin?.accountId || null,
     phone: pendingLogin?.phone || null,
     firebaseConfigured: Boolean(firebaseSessionRef),
     firebaseError: firebaseError || null,
@@ -306,10 +366,11 @@ app.get("/api/status", async (req, res) => {
   });
 });
 
-// Login: send code
+// Login: send code (for the selected account slot)
 app.post("/api/login/send-code", async (req, res) => {
   try {
     ensureConfig();
+    const accountId = parseAccountId(req.body.account_id);
     const phone = String(req.body.phone || "").trim();
     if (!phone.startsWith("+")) return res.status(400).json({ error: "Use international format, e.g. +8801XXXXXXXXX." });
     if (loginBusy) return res.status(409).json({ error: "A login attempt is already in progress." });
@@ -317,13 +378,20 @@ app.post("/api/login/send-code", async (req, res) => {
     const temp = createClient();
     await temp.connect();
     const sent = await temp.sendCode({ apiId: API_ID, apiHash: API_HASH }, phone);
-    pendingLogin = { temp, phone, phoneCodeHash: sent.phoneCodeHash };
-    res.json({ ok: true, message: "Telegram login code sent. Enter it in the dashboard." });
+    pendingLogin = { accountId, temp, phone, phoneCodeHash: sent.phoneCodeHash };
+    res.json({ ok: true, message: `Telegram login code sent for Account ${accountId}. Enter it in the dashboard.` });
   } catch (e) {
     loginBusy = false;
     res.status(400).json({ error: e.message });
   }
 });
+
+async function finishLogin(res) {
+  const { accountId, temp } = pendingLogin;
+  await activateAccount(accountId, temp);
+  pendingLogin = null; loginBusy = false;
+  res.json({ ok: true, message: `Telegram Account ${accountId} connected.` });
+}
 
 // Login: verify code; if 2FA is enabled, submit password next.
 app.post("/api/login/verify", async (req, res) => {
@@ -342,12 +410,7 @@ app.post("/api/login/verify", async (req, res) => {
       }
       throw e;
     }
-    client = pendingLogin.temp;
-    isConnected = true;
-    await persistCurrentSession();
-    console.log("Telegram login authorized; encrypted session saved to:", SESSION_FILE);
-    pendingLogin = null; loginBusy = false;
-    res.json({ ok: true, message: "Telegram account connected." });
+    await finishLogin(res);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -357,45 +420,43 @@ app.post("/api/login/2fa", async (req, res) => {
     const password = String(req.body.password || "");
     const passwordInfo = await pendingLogin.temp.invoke(new Api.account.GetPassword());
     const passwordCheck = await computeCheck(passwordInfo, password);
-    await pendingLogin.temp.invoke(new Api.auth.CheckPassword({
-      password: passwordCheck
-    }));
-    client = pendingLogin.temp;
-    isConnected = true;
-    await persistCurrentSession();
-    console.log("Telegram login authorized; encrypted session saved to:", SESSION_FILE);
-    pendingLogin = null; loginBusy = false;
-    res.json({ ok: true, message: "Telegram account connected." });
+    await pendingLogin.temp.invoke(new Api.auth.CheckPassword({ password: passwordCheck }));
+    await finishLogin(res);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Disconnect one Telegram account (account_id) or all of them (no account_id).
 app.post("/api/logout", async (req, res) => {
   try {
-    if (client) await client.disconnect();
-    client = null; isConnected = false;
-    if (pendingLogin?.temp) { try { await pendingLogin.temp.disconnect(); } catch (_) {} }
-    pendingLogin = null; loginBusy = false;
-    process.env.SESSION_STRING = "";
-    if (firebaseSessionRef) await firebaseSessionRef.remove();
-    if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
+    const ids = req.body?.account_id ? [parseAccountId(req.body.account_id)] : Array.from({ length: MAX_ACCOUNTS }, (_, i) => i + 1);
+    for (const id of ids) {
+      const c = clients.get(id);
+      if (c) { try { await c.disconnect(); } catch (_) {} }
+      clients.delete(id);
+      if (id === 1) process.env.SESSION_STRING = "";
+      await removeStoredSession(id);
+    }
+    if (pendingLogin?.temp && ids.includes(pendingLogin.accountId)) { try { await pendingLogin.temp.disconnect(); } catch (_) {} pendingLogin = null; loginBusy = false; }
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// Groups: add only groups where this account is allowed to post.
+// Groups: each group belongs to one Telegram account; add only groups where that account may post.
 app.get("/api/groups", (req, res) => {
   if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
-  res.json(db.prepare("SELECT * FROM groups ORDER BY added_at DESC").all());
+  res.json(db.prepare("SELECT * FROM groups ORDER BY account_id, added_at DESC").all());
 });
-app.post("/api/groups", requireTelegram, async (req, res) => {
+app.post("/api/groups", async (req, res) => {
   try {
+    const accountId = parseAccountId(req.body.account_id);
+    const tg = await getAccountClient(accountId);
     const username = normalizeUsername(req.body.username);
     if (!username) return res.status(400).json({ error: "Enter a public group username or t.me link." });
-    const entity = await client.getEntity(username);
+    const entity = await tg.getEntity(username);
     const title = entity.title || username;
     // Verify the account can resolve the group. Actual send permission is checked by Telegram at post time.
-    const result = db.prepare("INSERT OR IGNORE INTO groups (username, title) VALUES (?, ?)").run(username, title);
-    const row = db.prepare("SELECT * FROM groups WHERE username = ?").get(username);
+    db.prepare("INSERT OR IGNORE INTO groups (account_id, username, title) VALUES (?, ?, ?)").run(accountId, username, title);
+    const row = db.prepare("SELECT * FROM groups WHERE account_id = ? AND username = ?").get(accountId, username);
     if (row) firebaseSync.syncGroup(row);
     res.json(row);
   } catch (e) { res.status(400).json({ error: "Could not add group: " + e.message }); }
@@ -432,11 +493,12 @@ function parseScheduleAt(value) {
 }
 
 // Create scheduled post (one group per scheduled item)
-app.post("/api/posts", requireTelegram, upload.single("image"), (req, res) => {
+app.post("/api/posts", upload.single("image"), async (req, res) => {
   try {
     const groupId = Number(req.body.group_id);
     const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId);
     if (!group) return res.status(400).json({ error: "Choose a group first." });
+    await getAccountClient(group.account_id);
     const text = String(req.body.text || "").trim();
     const interval = Math.max(0, Math.min(10080, Number(req.body.interval_minutes || 0)));
     const scheduleAt = parseScheduleAt(req.body.schedule_at);
@@ -455,7 +517,7 @@ app.post("/api/posts", requireTelegram, upload.single("image"), (req, res) => {
 app.get("/api/posts", (req, res) => {
   if (!dataRestoreReady) return res.status(503).json({ error: "Stored dashboard data is still restoring. Try again shortly." });
   res.json(db.prepare(`
-    SELECT posts.*, groups.title AS group_title, groups.username
+    SELECT posts.*, groups.title AS group_title, groups.username, groups.account_id
     FROM posts JOIN groups ON groups.id = posts.group_id
     ORDER BY posts.created_at DESC
   `).all());
@@ -483,24 +545,26 @@ app.get("/api/history", (req, res) => {
 // Scheduler: due items are processed sequentially, not in parallel.
 let schedulerBusy = false;
 async function processDuePosts() {
-  if (!dataRestoreReady || schedulerBusy || automationPaused || !client || !isConnected) return;
+  if (!dataRestoreReady || schedulerBusy || automationPaused || !clients.size) return;
   schedulerBusy = true;
   try {
     const now = new Date().toISOString();
     const due = db.prepare(`
-      SELECT posts.*, groups.username
+      SELECT posts.*, groups.username, groups.account_id
       FROM posts JOIN groups ON groups.id = posts.group_id
       WHERE posts.active = 1 AND posts.next_run_at <= ?
+        AND groups.account_id IN (${Array.from(clients.keys()).join(",")})
       ORDER BY posts.next_run_at ASC LIMIT 1
     `).all(now);
     if (!due.length) return;
     const post = due[0];
     try {
-      const entity = await client.getEntity(post.username);
+      const tg = clients.get(post.account_id);
+      const entity = await tg.getEntity(post.username);
       if (post.media_path && fs.existsSync(post.media_path)) {
-        await client.sendFile(entity, { file: post.media_path, caption: post.text || "" });
+        await tg.sendFile(entity, { file: post.media_path, caption: post.text || "" });
       } else {
-        await client.sendMessage(entity, { message: post.text });
+        await tg.sendMessage(entity, { message: post.text });
       }
       const hRow = db.prepare("INSERT INTO history (post_id, group_name, result, detail) VALUES (?, ?, 'SUCCESS', 'Posted successfully')").run(post.id, post.username);
       firebaseSync.syncHistory({ id: hRow.lastInsertRowid, post_id: post.id, group_name: post.username, result: "SUCCESS", detail: "Posted successfully", posted_at: new Date().toISOString() });
@@ -532,13 +596,15 @@ app.listen(PORT, HOST, async () => {
   }
   dataRestoreReady = restored;
   if (!restored) console.error("[Firebase Sync] Startup is waiting for a successful data restore; scheduled posting remains paused.");
-  await connectSavedSession();
+  await connectAllSavedSessions();
   const { startControlBot } = require("./control-bot");
   startControlBot({
     db,
     firebaseSync,
-    getClient: () => client,
-    isConnected: () => isConnected,
+    getClient: id => clients.get(id) || null,
+    isConnected: id => clients.has(id),
+    getAccounts: accountList,
+    maxAccounts: MAX_ACCOUNTS,
     uploadsDir: UPLOADS_DIR,
     getPaused: () => automationPaused,
     setPaused: value => { automationPaused = Boolean(value); }

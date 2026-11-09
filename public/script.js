@@ -17,7 +17,7 @@ async function unlock(){
   }catch(e){authenticated=false;toast(e.message)}
 }
 async function sendCode(){
-  try{const d=await api("/api/login/send-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({phone:$("phone").value})});$("verifyBox").classList.remove("hidden");toast(d.message)}catch(e){toast(e.message)}
+  try{const d=await api("/api/login/send-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:Number($("loginAccount").value),phone:$("phone").value})});$("verifyBox").classList.remove("hidden");toast(d.message)}catch(e){toast(e.message)}
 }
 async function verifyCode(){
   try{const d=await api("/api/login/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$("code").value})});if(d.needs2FA){toast(d.message);return}toast(d.message);refresh()}catch(e){toast(e.message)}
@@ -27,12 +27,16 @@ async function verify2FA(){
 }
 async function logout(){try{await api("/auth/logout",{method:"POST"});authenticated=false;toast("Dashboard session ended");unlock()}catch(e){toast(e.message)}}
 async function addGroup(){
-  try{const d=await api("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("groupName").value})});$("groupName").value="";toast("Group added: "+(d.title||d.username));refresh()}catch(e){toast(e.message)}
+  try{const d=await api("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:Number($("groupAccount").value),username:$("groupName").value})});$("groupName").value="";toast("Group added: "+(d.title||d.username));refresh()}catch(e){toast(e.message)}
 }
 async function removeGroup(id){if(!confirm("Remove this group and its scheduled posts?"))return;try{await api("/api/groups/"+id,{method:"DELETE"});refresh()}catch(e){toast(e.message)}}
 async function togglePost(id){try{await api("/api/posts/"+id+"/toggle",{method:"POST"});refresh()}catch(e){toast(e.message)}}
 async function deletePost(id){if(!confirm("Delete this scheduled post?"))return;try{await api("/api/posts/"+id,{method:"DELETE"});refresh()}catch(e){toast(e.message)}}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+let accountsCache=[];
+function accName(id){const a=accountsCache.find(x=>x.id===id);return "Account "+id+(a&&a.label?" · "+a.label:"")}
+async function disconnectAccount(id){if(!confirm("Disconnect "+accName(id)+"?"))return;try{await api("/api/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({account_id:id})});toast("Account disconnected");refresh()}catch(e){toast(e.message)}}
+function fillSelect(el,html){const v=el.value;el.innerHTML=html;if(v&&[...el.options].some(o=>o.value===v&&!o.disabled))el.value=v}
 function fmt(s){
   if(!s) return "—";
   try {
@@ -45,10 +49,17 @@ async function refresh(){
   try{
     const [status,groups,posts,history]=await Promise.all([api("/api/status"),api("/api/groups"),api("/api/posts"),api("/api/history")]);
     $("status").className="badge "+(status.connected?"on":"off");$("status").textContent=status.connected?"● Connected":"● Disconnected";
-    $("statAccount").textContent=status.connected?"Connected":"Not connected";$("statGroups").textContent=groups.length;$("statPosts").textContent=posts.filter(p=>p.active).length;$("statSuccess").textContent=history.filter(h=>h.result==="SUCCESS").length;
-    $("groupsList").innerHTML=groups.length?groups.map(g=>`<div class="list-row"><div><b>${esc(g.title||g.username)}</b><small>@${esc(g.username)}</small></div><button class="danger" onclick="removeGroup(${g.id})">Remove</button></div>`).join(""):'<div class="empty">No groups added yet.</div>';
-    $("targetGroup").innerHTML='<option value="">Select a group</option>'+groups.map(g=>`<option value="${g.id}">${esc(g.title||g.username)} (@${esc(g.username)})</option>`).join("");
-    $("postsList").innerHTML=posts.length?`<table><thead><tr><th>Group</th><th>Content</th><th>Next run</th><th>Repeat</th><th>Status</th><th>Actions</th></tr></thead><tbody>${posts.map(p=>`<tr><td>@${esc(p.username)}</td><td>${esc((p.text||"Image post").slice(0,55))}</td><td>${fmt(p.next_run_at)}</td><td>${p.interval_minutes?p.interval_minutes+" min":"Once"}</td><td><span class="pill ${p.active?"success":""}">${p.active?"Active":"Paused / done"}</span></td><td><button class="ghost" onclick="togglePost(${p.id})">${p.active?"Pause":"Resume"}</button> <button class="danger" onclick="deletePost(${p.id})">Delete</button></td></tr>`).join("")}</tbody></table>`:'<div class="empty">No scheduled posts yet.</div>';
+    accountsCache=status.accounts||[];
+    const connectedCount=accountsCache.filter(a=>a.connected).length;
+    $("statAccount").textContent=connectedCount?connectedCount+" / "+accountsCache.length+" connected":"Not connected";
+    $("accountCards").innerHTML=accountsCache.map(a=>`<div class="list-row"><div><b>Account ${a.id}</b><small>${a.connected?esc((a.label||"Connected")+(a.phone?" · "+a.phone:"")):"Not connected"}</small></div>${a.connected?`<button class="danger" onclick="disconnectAccount(${a.id})">Disconnect</button>`:'<span class="pill">Offline</span>'}</div>`).join("");
+    fillSelect($("loginAccount"),accountsCache.map(a=>`<option value="${a.id}">Account ${a.id}${a.connected?" (connected"+(a.label?": "+esc(a.label):"")+")":" (not connected)"}</option>`).join(""));
+    fillSelect($("groupAccount"),accountsCache.map(a=>`<option value="${a.id}"${a.connected?"":" disabled"}>${esc(accName(a.id))}${a.connected?"":" (not connected)"}</option>`).join(""));
+    if(!$("groupAccount").value){const first=accountsCache.find(a=>a.connected);if(first)$("groupAccount").value=String(first.id)}
+    $("statGroups").textContent=groups.length;$("statPosts").textContent=posts.filter(p=>p.active).length;$("statSuccess").textContent=history.filter(h=>h.result==="SUCCESS").length;
+    $("groupsList").innerHTML=groups.length?groups.map(g=>`<div class="list-row"><div><b>${esc(g.title||g.username)}</b><small>@${esc(g.username)} · ${esc(accName(g.account_id))}</small></div><button class="danger" onclick="removeGroup(${g.id})">Remove</button></div>`).join(""):'<div class="empty">No groups added yet.</div>';
+    $("targetGroup").innerHTML='<option value="">Select a group</option>'+groups.map(g=>`<option value="${g.id}">${esc(g.title||g.username)} (@${esc(g.username)}) — A${g.account_id}</option>`).join("");
+    $("postsList").innerHTML=posts.length?`<table><thead><tr><th>Group</th><th>Content</th><th>Next run</th><th>Repeat</th><th>Status</th><th>Actions</th></tr></thead><tbody>${posts.map(p=>`<tr><td>@${esc(p.username)} <small>A${p.account_id}</small></td><td>${esc((p.text||"Image post").slice(0,55))}</td><td>${fmt(p.next_run_at)}</td><td>${p.interval_minutes?p.interval_minutes+" min":"Once"}</td><td><span class="pill ${p.active?"success":""}">${p.active?"Active":"Paused / done"}</span></td><td><button class="ghost" onclick="togglePost(${p.id})">${p.active?"Pause":"Resume"}</button> <button class="danger" onclick="deletePost(${p.id})">Delete</button></td></tr>`).join("")}</tbody></table>`:'<div class="empty">No scheduled posts yet.</div>';
     $("historyList").innerHTML=history.length?`<table><thead><tr><th>Time</th><th>Group</th><th>Result</th><th>Details</th></tr></thead><tbody>${history.map(h=>`<tr><td>${fmt(h.posted_at)}</td><td>@${esc(h.group_name)}</td><td><span class="pill ${h.result==="SUCCESS"?"success":"failed"}">${esc(h.result)}</span></td><td>${esc(h.detail)}</td></tr>`).join("")}</tbody></table>`:'<div class="empty">No posting activity yet.</div>';
   }catch(e){if(e.message.toLowerCase().includes("password")){authenticated=false;unlock()}else toast(e.message)}
 }

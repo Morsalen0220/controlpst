@@ -28,17 +28,26 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
       }
       const data = snapshot.val() || {};
 
+      // 0. Restore account labels
+      if (data.accounts) {
+        const insertAccount = db.prepare("INSERT OR REPLACE INTO accounts (id, label, phone, updated_at) VALUES (@id, @label, @phone, @updated_at)");
+        db.transaction((items) => {
+          for (const a of items) insertAccount.run({ id: a.id, label: a.label || "", phone: a.phone || "", updated_at: a.updated_at || new Date().toISOString() });
+        })(Object.values(data.accounts));
+      }
+
       // 1. Restore Groups
       if (data.groups) {
         const insertGroup = db.prepare(`
-          INSERT OR REPLACE INTO groups (id, username, title, added_at)
-          VALUES (@id, @username, @title, @added_at)
+          INSERT OR REPLACE INTO groups (id, account_id, username, title, added_at)
+          VALUES (@id, @account_id, @username, @title, @added_at)
         `);
         const groupList = Object.values(data.groups);
         db.transaction((items) => {
           for (const g of items) {
             insertGroup.run({
               id: g.id,
+              account_id: Number(g.account_id || 1),
               username: g.username,
               title: g.title || g.username,
               added_at: g.added_at || new Date().toISOString()
@@ -119,6 +128,8 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
     if (!root) return;
     try {
       const groups = db.prepare("SELECT * FROM groups").all();
+      const accounts = db.prepare("SELECT * FROM accounts").all();
+      await Promise.all(accounts.map(a => syncAccount(a)));
       const posts = db.prepare("SELECT * FROM posts").all();
       const history = db.prepare("SELECT * FROM history").all();
       if (!groups.length && !posts.length && !history.length) return true;
@@ -132,11 +143,23 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
     }
   }
 
+  function syncAccount(account) {
+    const root = getRootRef();
+    if (!root || !account || !account.id) return;
+    return root.child(`accounts/${account.id}`).set({
+      id: account.id,
+      label: account.label || "",
+      phone: account.phone || "",
+      updated_at: account.updated_at || new Date().toISOString()
+    }).catch(err => console.error("[Firebase Sync] Error syncing account:", err.message));
+  }
+
   function syncGroup(group) {
     const root = getRootRef();
     if (!root || !group || !group.id) return;
     return root.child(`groups/${group.id}`).set({
       id: group.id,
+      account_id: Number(group.account_id || 1),
       username: group.username,
       title: group.title || group.username,
       added_at: group.added_at || new Date().toISOString()
@@ -237,6 +260,7 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
 
   return {
     restoreAllFromFirebase,
+    syncAccount,
     syncGroup,
     deleteGroup,
     syncPost,

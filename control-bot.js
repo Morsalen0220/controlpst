@@ -2,7 +2,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
 const path = require("path");
 
-function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir, getPaused, setPaused }) {
+function startControlBot({ db, firebaseSync, getClient, isConnected, getAccounts, maxAccounts, uploadsDir, getPaused, setPaused }) {
   const token = process.env.BOT_TOKEN;
   const ownerId = String(process.env.BOT_OWNER_ID || "");
   if (!token || !ownerId) {
@@ -36,13 +36,28 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir,
     return bot.sendMessage(chatId, text, { ...extra, disable_web_page_preview: true });
   }
   function groups() {
-    return db.prepare("SELECT * FROM groups ORDER BY title COLLATE NOCASE").all();
+    return db.prepare("SELECT * FROM groups ORDER BY account_id, title COLLATE NOCASE").all();
+  }
+  function accLabel(id) {
+    const a = getAccounts().find(x => x.id === id);
+    return `Account ${id}${a && a.label ? " (" + a.label + ")" : ""}`;
+  }
+  function accountKeyboard(prefix, onlyConnected) {
+    const list = getAccounts().filter(a => !onlyConnected || a.connected);
+    return {
+      reply_markup: {
+        inline_keyboard: [
+          ...list.map(a => [{ text: `${a.connected ? "✅" : "❌"} ${accLabel(a.id)}`, callback_data: `${prefix}:${a.id}` }]),
+          [{ text: "Cancel", callback_data: "wizard:cancel" }]
+        ]
+      }
+    };
   }
   function groupKeyboard(list) {
     return {
       reply_markup: {
         inline_keyboard: list.map(g => [{
-          text: `${g.title || g.username} (@${g.username})`,
+          text: `[A${g.account_id}] ${g.title || g.username} (@${g.username})`,
           callback_data: `choose_group:${g.id}`
         }])
       }
@@ -164,31 +179,30 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir,
         return say(chatId, helpText(), { parse_mode: "Markdown", ...mainKeyboard });
       }
       if (text === "/status" || text === "📊 Status") {
-        const client = getClient();
         const active = db.prepare("SELECT COUNT(*) AS n FROM posts WHERE active=1").get().n;
         const groupCount = db.prepare("SELECT COUNT(*) AS n FROM groups").get().n;
         return say(chatId,
-          `📊 *System Status*\n\nPersonal account: ${isConnected() ? "✅ Connected" : "❌ Disconnected"}\nGroups: ${groupCount}\nActive schedules: ${active}\nAutomation: ${getPaused() ? "⏸ Paused" : "▶️ Running"}\nControl bot: ✅ Online`,
+          `📊 *System Status*\n\n${getAccounts().map(a => `${a.connected ? "✅" : "❌"} Account ${a.id}${a.label ? " — " + a.label : ""}`).join("\n")}\nGroups: ${groupCount}\nActive schedules: ${active}\nAutomation: ${getPaused() ? "⏸ Paused" : "▶️ Running"}\nControl bot: ✅ Online`,
           { parse_mode: "Markdown", ...mainKeyboard });
       }
       if (text === "/groups" || text === "📂 Groups") {
         const list = groups();
         if (!list.length) return say(chatId, "এখনো কোনো Group যোগ করা হয়নি। /addgroup ব্যবহার করুন।", mainKeyboard);
-        return say(chatId, "📂 *Your Groups*\n" + list.map((g,i)=>`${i+1}. ${g.title || g.username} — @${g.username}`).join("\n"), { parse_mode:"Markdown", ...mainKeyboard });
+        return say(chatId, "📂 *Your Groups*\n" + list.map((g,i)=>`${i+1}. [A${g.account_id}] ${g.title || g.username} — @${g.username}`).join("\n"), { parse_mode:"Markdown", ...mainKeyboard });
       }
       if (text === "/addgroup" || text === "➕ Add Group") {
-        states.set(String(msg.from.id), { step: "add_group" });
-        return say(chatId, "যে Public Group-এ আপনার Personal Account পোস্ট করার অনুমতি রাখে, তার @username অথবা t.me link পাঠান।");
+        states.set(String(msg.from.id), { step: "choose_account" });
+        return say(chatId, "কোন Telegram Account দিয়ে Group যোগ করবেন?", accountKeyboard("add_acc", true));
       }
       if (text === "/removegroup" || text === "➖ Remove Group") {
         const list = groups();
         if (!list.length) return say(chatId, "কোনো Group নেই।", mainKeyboard);
         return say(chatId, "কোন Group remove করবেন?", {
-          reply_markup: { inline_keyboard: list.map(g => [{ text: `❌ ${g.title || g.username}`, callback_data: `remove_group:${g.id}` }]) }
+          reply_markup: { inline_keyboard: list.map(g => [{ text: `❌ [A${g.account_id}] ${g.title || g.username}`, callback_data: `remove_group:${g.id}` }]) }
         });
       }
       if (text === "/post" || text === "✍️ Create Post") {
-        if (!isConnected()) return say(chatId, "আগে Web Dashboard থেকে Personal Telegram Account connect করুন।");
+        if (!getAccounts().some(a => a.connected)) return say(chatId, "আগে Web Dashboard থেকে Personal Telegram Account connect করুন।");
         const list = groups();
         if (!list.length) return say(chatId, "আগে /addgroup দিয়ে একটি Group যোগ করুন।", mainKeyboard);
         states.set(String(msg.from.id), { step: "choose_group" });
@@ -196,11 +210,11 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir,
       }
       if (text === "/schedule" || text === "🗓 Scheduled Posts") {
         const rows = db.prepare(`
-          SELECT p.*, g.username FROM posts p JOIN groups g ON g.id=p.group_id
+          SELECT p.*, g.username, g.account_id FROM posts p JOIN groups g ON g.id=p.group_id
           ORDER BY p.next_run_at ASC LIMIT 30
         `).all();
         if (!rows.length) return say(chatId, "কোনো scheduled post নেই।", mainKeyboard);
-        const lines = rows.map(p => `#${p.id} @${p.username}\n${(p.text || "🖼 Image post").slice(0,80)}\nNext: ${fmtDate(p.next_run_at)} | ${p.interval_minutes ? p.interval_minutes+" min repeat" : "Once"} | ${p.active ? "Active" : "Paused/Done"}`);
+        const lines = rows.map(p => `#${p.id} [A${p.account_id}] @${p.username}\n${(p.text || "🖼 Image post").slice(0,80)}\nNext: ${fmtDate(p.next_run_at)} | ${p.interval_minutes ? p.interval_minutes+" min repeat" : "Once"} | ${p.active ? "Active" : "Paused/Done"}`);
         return say(chatId, "🗓 *Scheduled Posts*\n\n" + lines.join("\n\n"), { parse_mode:"Markdown", ...mainKeyboard });
       }
       if (text === "/history" || text === "📜 Post History") {
@@ -225,15 +239,15 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir,
 
       // Wizard states
       if (state?.step === "add_group") {
-        if (!isConnected()) return say(chatId, "Personal Telegram Account connected নয়। Dashboard থেকে login করুন।");
+        if (!state.accountId || !isConnected(state.accountId)) return say(chatId, "Selected Telegram Account connected নয়। Dashboard থেকে login করুন।");
         const username = text.replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "").replace(/\/.*$/, "");
         if (!username || !/^[a-zA-Z0-9_]{5,}$/.test(username)) return say(chatId, "সঠিক @username বা t.me link দিন।");
-        const entity = await getClient().getEntity(username);
-        db.prepare("INSERT OR IGNORE INTO groups (username,title) VALUES (?,?)").run(username, entity.title || username);
-        const groupRow = db.prepare("SELECT * FROM groups WHERE username = ?").get(username);
+        const entity = await getClient(state.accountId).getEntity(username);
+        db.prepare("INSERT OR IGNORE INTO groups (account_id,username,title) VALUES (?,?,?)").run(state.accountId, username, entity.title || username);
+        const groupRow = db.prepare("SELECT * FROM groups WHERE account_id = ? AND username = ?").get(state.accountId, username);
         if (firebaseSync && groupRow) firebaseSync.syncGroup(groupRow);
         states.delete(String(msg.from.id));
-        return say(chatId, `✅ Group যোগ হয়েছে: ${entity.title || username} (@${username})`, mainKeyboard);
+        return say(chatId, `✅ Group যোগ হয়েছে: ${entity.title || username} (@${username}) — ${accLabel(state.accountId)}`, mainKeyboard);
       }
       if (state?.step === "content") {
         const caption = String(msg.caption || msg.text || "").trim();
@@ -299,6 +313,15 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir,
         await bot.answerCallbackQuery(query.id, { text: "Cancelled" });
         return say(chatId, "Post creation cancelled.", mainKeyboard);
       }
+      if (data.startsWith("add_acc:")) {
+        if (!state || state.step !== "choose_account") return bot.answerCallbackQuery(query.id, { text: "Start /addgroup again." });
+        const id = Number(data.split(":")[1]);
+        if (!isConnected(id)) return bot.answerCallbackQuery(query.id, { text: "Account not connected." });
+        state.accountId = id;
+        state.step = "add_group";
+        await bot.answerCallbackQuery(query.id, { text: "Account selected" });
+        return say(chatId, `${accLabel(id)} নির্বাচিত।\nযে Public Group-এ এই Account পোস্ট করার অনুমতি রাখে, তার @username অথবা t.me link পাঠান।`);
+      }
       if (data.startsWith("remove_group:")) {
         const id = Number(data.split(":")[1]);
         const g = db.prepare("SELECT * FROM groups WHERE id=?").get(id);
@@ -315,11 +338,12 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, uploadsDir,
         const id = Number(data.split(":")[1]);
         const g = db.prepare("SELECT * FROM groups WHERE id=?").get(id);
         if (!g) return bot.answerCallbackQuery(query.id, { text: "Group not found." });
+        if (!isConnected(g.account_id)) return bot.answerCallbackQuery(query.id, { text: `${accLabel(g.account_id)} is disconnected.`, show_alert: true });
         state.groupId = id;
         state.groupName = g.username;
         state.step = "content";
         await bot.answerCallbackQuery(query.id, { text: "Group selected" });
-        return say(chatId, `Selected @${g.username}.\nএখন Post Text লিখুন অথবা Image + Caption পাঠান। শুধু Image-ও পাঠাতে পারেন।`);
+        return say(chatId, `Selected @${g.username} (${accLabel(g.account_id)}).\nএখন Post Text লিখুন অথবা Image + Caption পাঠান। শুধু Image-ও পাঠাতে পারেন।`);
       }
       if (data.startsWith("timing:")) {
         if (!state || state.step !== "timing") return bot.answerCallbackQuery(query.id, { text: "Post flow expired." });

@@ -21,7 +21,7 @@
   <main>
     <header><div><p class="eyebrow">CONTROL CENTER</p><h1>Dashboard</h1></div><div class="top-right"><span id="status" class="badge off">● Disconnected</span><button class="ghost" onclick="logout()">Log out</button></div></header>
     <section class="stats">
-      <article><span>Telegram account</span><strong id="statAccount">Not connected</strong><small>Personal account session</small></article>
+      <article><span>Telegram account</span><strong id="statAccount">Not connected</strong><small>Connected accounts</small></article>
       <article><span>Groups added</span><strong id="statGroups">0</strong><small>Destinations you manage</small></article>
       <article><span>Scheduled posts</span><strong id="statPosts">0</strong><small>Active and paused</small></article>
       <article><span>Successful posts</span><strong id="statSuccess">0</strong><small>From posting history</small></article>
@@ -30,7 +30,9 @@
     <section class="grid two">
       <article class="panel" id="account">
         <div class="panel-head"><div><p class="eyebrow">CONNECTION</p><h2>Telegram Account</h2></div></div>
+        <div id="accountCards" class="list"></div>
         <div id="loginForm">
+          <label>Account slot</label><select id="loginAccount"></select>
           <label>Phone number (international format)</label><input id="phone" placeholder="+8801XXXXXXXXX">
           <button class="primary" onclick="sendCode()">Send login code</button>
           <div id="verifyBox" class="hidden">
@@ -44,6 +46,7 @@
       </article>
       <article class="panel" id="groups">
         <div class="panel-head"><div><p class="eyebrow">DESTINATIONS</p><h2>Manage Groups</h2></div></div>
+        <label>Telegram account</label><select id="groupAccount"></select>
         <label>Public group username or t.me link</label><div class="inline"><input id="groupName" placeholder="@publicgroup"><button class="primary" onclick="addGroup()">Add</button></div>
         <div id="groupsList" class="list"></div>
       </article>

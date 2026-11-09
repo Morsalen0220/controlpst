@@ -122,15 +122,14 @@ CREATE TABLE IF NOT EXISTS history (
 );
 `);
 // Migrate single-account databases: existing groups belong to account 1.
+db.pragma("foreign_keys = OFF");
 if (!db.prepare("PRAGMA table_info(groups)").all().some(c => c.name === "account_id")) {
-  db.pragma("foreign_keys = OFF");
   db.transaction(() => {
     db.exec(`CREATE TABLE groups_new ${GROUPS_SCHEMA};
       INSERT INTO groups_new (id, username, title, added_at) SELECT id, username, title, added_at FROM groups;
       DROP TABLE groups;
       ALTER TABLE groups_new RENAME TO groups;`);
   })();
-  db.pragma("foreign_keys = ON");
 }
 
 const { createFirebaseSync } = require("./firebase-sync");
@@ -141,7 +140,13 @@ const firebaseSync = createFirebaseSync({
 });
 
 app.use(express.json({ limit: "2mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "public"), {
+  etag: false,
+  lastModified: false,
+  setHeaders: (res) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  }
+}));
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
@@ -252,24 +257,37 @@ async function saveEncryptedSession(id, sessionString) {
 async function readEncryptedSession(id) {
   const ref = sessionRef(id);
   if (ref) {
-    const value = (await ref.get()).val();
-    if (value && value.encrypted) return decryptSession(value.encrypted);
+    try {
+      const value = (await ref.get()).val();
+      if (value && value.encrypted) return decryptSession(value.encrypted);
+    } catch (e) {
+      console.warn(`Could not read session from telegramSessions/${id}:`, e.message);
+    }
     if (id === 1 && firebaseSessionRef) {
       // Legacy single-account location: private/telegramSession
-      const legacy = (await firebaseSessionRef.get()).val();
-      if (legacy && legacy.encrypted) {
-        const decrypted = decryptSession(legacy.encrypted);
-        // Copy to new multi-account location while keeping legacy intact
-        try {
-          await ref.set({ encrypted: legacy.encrypted, updatedAt: new Date().toISOString(), version: 2 });
-        } catch (_) {}
-        return decrypted;
+      try {
+        const legacy = (await firebaseSessionRef.get()).val();
+        if (legacy && legacy.encrypted) {
+          const decrypted = decryptSession(legacy.encrypted);
+          try {
+            await ref.set({ encrypted: legacy.encrypted, updatedAt: new Date().toISOString(), version: 2 });
+          } catch (_) {}
+          return decrypted;
+        }
+      } catch (e) {
+        console.warn("Could not read legacy session from telegramSession:", e.message);
       }
     }
   }
   const file = sessionFile(id);
-  if (!fs.existsSync(file)) return "";
-  return decryptSession(fs.readFileSync(file, "utf8"));
+  if (fs.existsSync(file)) {
+    try {
+      return decryptSession(fs.readFileSync(file, "utf8"));
+    } catch (e) {
+      console.warn(`Could not read local session file for account ${id}:`, e.message);
+    }
+  }
+  return "";
 }
 async function removeStoredSession(id) {
   const ref = sessionRef(id);
@@ -366,9 +384,13 @@ function normalizeUsername(value) {
 }
 
 let restoreDataPromise = null;
+let lastEmptyRestoreAttempt = 0;
 async function ensureDataRestored() {
-  if (dataRestoreReady) return true;
+  const groupCount = db.prepare("SELECT COUNT(*) AS n FROM groups").get().n;
+  const shouldRetryEmpty = dataRestoreReady && groupCount === 0 && firebaseSessionRef && (Date.now() - lastEmptyRestoreAttempt > 30000);
+  if (dataRestoreReady && !shouldRetryEmpty) return true;
   if (restoreDataPromise) return restoreDataPromise;
+  lastEmptyRestoreAttempt = Date.now();
   restoreDataPromise = (async () => {
     try {
       const restored = await firebaseSync.restoreAllFromFirebase();

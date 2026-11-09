@@ -28,13 +28,19 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
       }
       const data = snapshot.val() || {};
 
+      db.pragma("foreign_keys = OFF");
+
       // 0. Restore account labels
       if (data.accounts) {
         const insertAccount = db.prepare("INSERT OR REPLACE INTO accounts (id, label, phone, updated_at) VALUES (@id, @label, @phone, @updated_at)");
-        const accountList = Object.values(data.accounts).filter(a => a && a.id);
+        const accountEntries = Object.entries(data.accounts).filter(([, a]) => a && typeof a === "object");
         db.transaction((items) => {
-          for (const a of items) insertAccount.run({ id: Number(a.id), label: a.label || "", phone: a.phone || "", updated_at: a.updated_at || new Date().toISOString() });
-        })(accountList);
+          for (const [k, a] of items) {
+            const id = Number(a.id || k);
+            if (!id) continue;
+            insertAccount.run({ id, label: a.label || "", phone: a.phone || "", updated_at: a.updated_at || new Date().toISOString() });
+          }
+        })(accountEntries);
       }
 
       // 1. Restore Groups
@@ -43,19 +49,21 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
           INSERT OR REPLACE INTO groups (id, account_id, username, title, added_at)
           VALUES (@id, @account_id, @username, @title, @added_at)
         `);
-        const groupList = Object.values(data.groups).filter(g => g && g.id && g.username);
+        const groupEntries = Object.entries(data.groups).filter(([, g]) => g && g.username);
         db.transaction((items) => {
-          for (const g of items) {
+          for (const [k, g] of items) {
+            const id = Number(g.id || k);
+            if (!id) continue;
             insertGroup.run({
-              id: Number(g.id),
+              id,
               account_id: Number(g.account_id || 1),
               username: g.username,
               title: g.title || g.username,
               added_at: g.added_at || new Date().toISOString()
             });
           }
-        })(groupList);
-        console.log(`[Firebase Sync] Restored ${groupList.length} groups from Firebase.`);
+        })(groupEntries);
+        console.log(`[Firebase Sync] Restored ${groupEntries.length} groups from Firebase.`);
       }
 
       // 2. Restore Posts & Media
@@ -64,41 +72,38 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
           INSERT OR REPLACE INTO posts (id, group_id, text, media_path, schedule_at, interval_minutes, next_run_at, active, created_at)
           VALUES (@id, @group_id, @text, @media_path, @schedule_at, @interval_minutes, @next_run_at, @active, @created_at)
         `);
-        const postList = Object.values(data.posts).filter(p => p && p.id && p.group_id);
-        db.pragma("foreign_keys = OFF");
-        try {
-          db.transaction((items) => {
-            for (const p of items) {
-              let localMediaPath = p.media_path || null;
-              if (p.media_base64) {
-                const filename = p.media_filename || `restored_${p.id}.jpg`;
-                localMediaPath = path.join(uploadsDir, filename);
-                try {
-                  fs.mkdirSync(uploadsDir, { recursive: true });
-                  if (!fs.existsSync(localMediaPath)) {
-                    fs.writeFileSync(localMediaPath, Buffer.from(p.media_base64, "base64"));
-                  }
-                } catch (err) {
-                  console.warn("[Firebase Sync] Error restoring image file:", err.message);
+        const postEntries = Object.entries(data.posts).filter(([, p]) => p && p.group_id);
+        db.transaction((items) => {
+          for (const [k, p] of items) {
+            const id = Number(p.id || k);
+            if (!id) continue;
+            let localMediaPath = p.media_path || null;
+            if (p.media_base64) {
+              const filename = p.media_filename || `restored_${id}.jpg`;
+              localMediaPath = path.join(uploadsDir, filename);
+              try {
+                fs.mkdirSync(uploadsDir, { recursive: true });
+                if (!fs.existsSync(localMediaPath)) {
+                  fs.writeFileSync(localMediaPath, Buffer.from(p.media_base64, "base64"));
                 }
+              } catch (err) {
+                console.warn("[Firebase Sync] Error restoring image file:", err.message);
               }
-              insertPost.run({
-                id: Number(p.id),
-                group_id: Number(p.group_id),
-                text: p.text || "",
-                media_path: localMediaPath,
-                schedule_at: p.schedule_at,
-                interval_minutes: Number(p.interval_minutes || 0),
-                next_run_at: p.next_run_at,
-                active: Number(p.active ?? 1),
-                created_at: p.created_at || new Date().toISOString()
-              });
             }
-          })(postList);
-        } finally {
-          db.pragma("foreign_keys = ON");
-        }
-        console.log(`[Firebase Sync] Restored ${postList.length} scheduled posts from Firebase.`);
+            insertPost.run({
+              id,
+              group_id: Number(p.group_id),
+              text: p.text || "",
+              media_path: localMediaPath,
+              schedule_at: p.schedule_at,
+              interval_minutes: Number(p.interval_minutes || 0),
+              next_run_at: p.next_run_at,
+              active: Number(p.active ?? 1),
+              created_at: p.created_at || new Date().toISOString()
+            });
+          }
+        })(postEntries);
+        console.log(`[Firebase Sync] Restored ${postEntries.length} scheduled posts from Firebase.`);
       }
 
       // 3. Restore History
@@ -107,11 +112,13 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
           INSERT OR REPLACE INTO history (id, post_id, group_name, result, detail, posted_at)
           VALUES (@id, @post_id, @group_name, @result, @detail, @posted_at)
         `);
-        const histList = Object.values(data.history).filter(h => h && h.id);
+        const histEntries = Object.entries(data.history).filter(([, h]) => h && typeof h === "object");
         db.transaction((items) => {
-          for (const h of items) {
+          for (const [k, h] of items) {
+            const id = Number(h.id || k);
+            if (!id) continue;
             insertHistory.run({
-              id: Number(h.id),
+              id,
               post_id: h.post_id || null,
               group_name: h.group_name || "",
               result: h.result || "SUCCESS",
@@ -119,8 +126,8 @@ function createFirebaseSync({ db, admin, uploadsDir }) {
               posted_at: h.posted_at || new Date().toISOString()
             });
           }
-        })(histList);
-        console.log(`[Firebase Sync] Restored ${histList.length} history records from Firebase.`);
+        })(histEntries);
+        console.log(`[Firebase Sync] Restored ${histEntries.length} history records from Firebase.`);
       }
       return true;
     } catch (e) {

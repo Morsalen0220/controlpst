@@ -205,8 +205,8 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, getAccounts
         if (!getAccounts().some(a => a.connected)) return say(chatId, "আগে Web Dashboard থেকে Personal Telegram Account connect করুন।");
         const list = groups();
         if (!list.length) return say(chatId, "আগে /addgroup দিয়ে একটি Group যোগ করুন।", mainKeyboard);
-        states.set(String(msg.from.id), { step: "choose_group" });
-        return say(chatId, "কোন Group-এ পোস্ট করবেন? একটি Group নির্বাচন করুন:", groupKeyboard(list));
+        states.set(String(msg.from.id), { step: "post_account" });
+        return say(chatId, "কোন Account থেকে পোস্ট করবেন?", accountKeyboard("post_acc", true));
       }
       if (text === "/schedule" || text === "🗓 Scheduled Posts") {
         const rows = db.prepare(`
@@ -313,6 +313,20 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, getAccounts
         await bot.answerCallbackQuery(query.id, { text: "Cancelled" });
         return say(chatId, "Post creation cancelled.", mainKeyboard);
       }
+      if (data.startsWith("post_acc:")) {
+        if (!state || state.step !== "post_account") return bot.answerCallbackQuery(query.id, { text: "Start /post again." });
+        const id = Number(data.split(":")[1]);
+        if (!isConnected(id)) return bot.answerCallbackQuery(query.id, { text: "Account not connected." });
+        const list = groups().filter(g => Number(g.account_id) === id);
+        await bot.answerCallbackQuery(query.id, { text: "Account selected" });
+        if (!list.length) {
+          states.delete(key);
+          return say(chatId, `${accLabel(id)}-এ কোনো Group নেই। আগে /addgroup দিয়ে এই Account-এ Group যোগ করুন।`, mainKeyboard);
+        }
+        state.accountId = id;
+        state.step = "choose_group";
+        return say(chatId, `${accLabel(id)} নির্বাচিত।\nকোন Group-এ পোস্ট করবেন?`, groupKeyboard(list));
+      }
       if (data.startsWith("add_acc:")) {
         if (!state || state.step !== "choose_account") return bot.answerCallbackQuery(query.id, { text: "Start /addgroup again." });
         const id = Number(data.split(":")[1]);
@@ -338,6 +352,7 @@ function startControlBot({ db, firebaseSync, getClient, isConnected, getAccounts
         const id = Number(data.split(":")[1]);
         const g = db.prepare("SELECT * FROM groups WHERE id=?").get(id);
         if (!g) return bot.answerCallbackQuery(query.id, { text: "Group not found." });
+        if (state.accountId && Number(g.account_id) !== state.accountId) return bot.answerCallbackQuery(query.id, { text: "This group belongs to another account.", show_alert: true });
         if (!isConnected(g.account_id)) return bot.answerCallbackQuery(query.id, { text: `${accLabel(g.account_id)} is disconnected.`, show_alert: true });
         state.groupId = id;
         state.groupName = g.username;

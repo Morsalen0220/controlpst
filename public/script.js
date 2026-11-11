@@ -34,7 +34,28 @@ async function togglePost(id){try{await api("/api/posts/"+id+"/toggle",{method:"
 async function deletePost(id){if(!confirm("Delete this scheduled post?"))return;try{await api("/api/posts/"+id,{method:"DELETE"});refresh()}catch(e){toast(e.message)}}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 let accountsCache=[];
+let groupsCache=[];
+// Show only the groups that belong to the account selected in "Post from account".
+function renderTargetGroups(){
+  const sel=$("targetGroup");if(!sel)return;
+  const acc=Number($("postAccount")?.value||0);
+  const list=acc?groupsCache.filter(g=>Number(g.account_id||1)===acc):groupsCache;
+  const prev=sel.value;
+  sel.innerHTML=list.length?'<option value="">Select a group</option>'+list.map(g=>`<option value="${g.id}">${esc(g.title||g.username)} (@${esc(g.username)})</option>`).join(""):'<option value="">No groups for this account — add one first</option>';
+  if(prev&&[...sel.options].some(o=>o.value===prev))sel.value=prev;
+}
 function ensureMultiAccountDOM(){
+  const tg=$("targetGroup");
+  if(tg&&!$("postAccount")){
+    const wrap=document.createElement("div");
+    wrap.innerHTML='<label>Post from account</label><select id="postAccount" name="account_id" required><option value="1">Account 1</option><option value="2">Account 2</option></select>';
+    const box=tg.closest("div");
+    box.parentNode.insertBefore(wrap,box);
+  }
+  if($("postAccount")&&!$("postAccount").dataset.bound){
+    $("postAccount").addEventListener("change",renderTargetGroups);
+    $("postAccount").dataset.bound="1";
+  }
   const loginForm=$("loginForm");
   if(loginForm&&!$("accountCards")){
     const cards=document.createElement("div");
@@ -96,7 +117,10 @@ async function refresh(){
     if($("groupAccount")&&!$("groupAccount").value){const first=accountsCache.find(a=>a.connected);if(first)$("groupAccount").value=String(first.id)}
     $("statGroups").textContent=groups.length;$("statPosts").textContent=posts.filter(p=>p.active).length;$("statSuccess").textContent=history.filter(h=>h.result==="SUCCESS").length;
     $("groupsList").innerHTML=groups.length?groups.map(g=>`<div class="list-row"><div><b>${esc(g.title||g.username)}</b><small>@${esc(g.username)} · ${esc(accName(g.account_id||1))}</small></div><button class="danger" onclick="removeGroup(${g.id})">Remove</button></div>`).join(""):'<div class="empty">No groups added yet.</div>';
-    $("targetGroup").innerHTML='<option value="">Select a group</option>'+groups.map(g=>`<option value="${g.id}">${esc(g.title||g.username)} (@${esc(g.username)}) — A${g.account_id||1}</option>`).join("");
+    groupsCache=groups;
+    fillSelect($("postAccount"),accountsCache.map(a=>`<option value="${a.id}"${a.connected?"":" disabled"}>${esc(accName(a.id))}${a.connected?"":" (not connected)"}</option>`).join(""));
+    if($("postAccount")&&!$("postAccount").value){const first=accountsCache.find(a=>a.connected);if(first)$("postAccount").value=String(first.id)}
+    renderTargetGroups();
     $("postsList").innerHTML=posts.length?`<table><thead><tr><th>Group</th><th>Content</th><th>Next run</th><th>Repeat</th><th>Status</th><th>Actions</th></tr></thead><tbody>${posts.map(p=>`<tr><td>@${esc(p.username)} <small>A${p.account_id||1}</small></td><td>${esc((p.text||"Image post").slice(0,55))}</td><td>${fmt(p.next_run_at)}</td><td>${p.interval_minutes?p.interval_minutes+" min":"Once"}</td><td><span class="pill ${p.active?"success":""}">${p.active?"Active":"Paused / done"}</span></td><td><button class="ghost" onclick="togglePost(${p.id})">${p.active?"Pause":"Resume"}</button> <button class="danger" onclick="deletePost(${p.id})">Delete</button></td></tr>`).join("")}</tbody></table>`:'<div class="empty">No scheduled posts yet.</div>';
     $("historyList").innerHTML=history.length?`<table><thead><tr><th>Time</th><th>Group</th><th>Result</th><th>Details</th></tr></thead><tbody>${history.map(h=>`<tr><td>${fmt(h.posted_at)}</td><td>@${esc(h.group_name)}</td><td><span class="pill ${h.result==="SUCCESS"?"success":"failed"}">${esc(h.result)}</span></td><td>${esc(h.detail)}</td></tr>`).join("")}</tbody></table>`:'<div class="empty">No posting activity yet.</div>';
   }catch(e){if(e.message.toLowerCase().includes("password")){authenticated=false;unlock()}else toast(e.message)}

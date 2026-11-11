@@ -588,6 +588,9 @@ app.post("/api/posts", upload.single("image"), async (req, res) => {
     const groupId = Number(req.body.group_id);
     const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId);
     if (!group) return res.status(400).json({ error: "Choose a group first." });
+    if (req.body.account_id && Number(req.body.account_id) !== Number(group.account_id)) {
+      return res.status(400).json({ error: `This group belongs to Account ${group.account_id}. Choose that account or a different group.` });
+    }
     await getAccountClient(group.account_id);
     const text = String(req.body.text || "").trim();
     const interval = Math.max(0, Math.min(10080, Number(req.body.interval_minutes || 0)));

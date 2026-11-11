@@ -56,6 +56,7 @@
       <div class="panel-head"><div><p class="eyebrow">CONTENT STUDIO</p><h2>Create a scheduled post</h2></div><span class="subtle">One destination per schedule</span></div>
       <form id="postForm">
         <div class="form-grid">
+          <div><label>Post from account</label><select id="postAccount" name="account_id" required><option value="1">Account 1</option><option value="2">Account 2</option></select></div>
           <div><label>Target group</label><select id="targetGroup" name="group_id" required><option value="">Add a group first</option></select></div>
           <div><label>Attach image (optional, max 10 MB)</label><input type="file" name="image" accept="image/*"></div>
           <div class="full"><label>Post text / caption</label><textarea name="text" rows="4" placeholder="Write your post here. Links are allowed."></textarea></div>
@@ -91,5 +92,5 @@
     <footer>TelePost · Local dashboard · Keep your Telegram session private</footer>
   </main>
 </div>
-<script src="script.js?v=2"></script>
+<script src="script.js?v=3"></script>
 </body></html>
